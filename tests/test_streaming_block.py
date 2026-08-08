@@ -107,7 +107,14 @@ def main() -> None:
     with tempfile.TemporaryDirectory() as directory:
         root = Path(directory)
         write_checkpoint(root, eager, cfg)
-        streamed, provider = load_streaming_dit(root)
+        original_quantize = mx.quantize
+        mx.quantize = lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("quantized checkpoint loading must not quantize random weights")
+        )
+        try:
+            streamed, provider = load_streaming_dit(root)
+        finally:
+            mx.quantize = original_quantize
         assert not any(key.startswith("blocks.") for key, _ in tree_flatten(streamed.parameters()))
         cache = ModulationCache.build_streaming(streamed, provider, args[3], dtype=mx.float32)
         got_v, got_a = streamed(

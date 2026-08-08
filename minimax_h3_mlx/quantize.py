@@ -44,7 +44,7 @@ from dataclasses import dataclass, field
 
 import mlx.core as mx
 import mlx.nn as nn
-from mlx.utils import tree_flatten
+from mlx.utils import tree_flatten, tree_map_with_path
 
 # Suffixes of the linear layers that carry the DiT's weight mass.
 CORE_LINEARS = (
@@ -116,6 +116,49 @@ def _class_predicate(config: QuantConfig, counts: dict[int, int] | None = None, 
     return predicate
 
 
+def apply_quantized_slots(model, class_predicate) -> None:
+    """Replace layers with checkpoint-shaped quantized modules without quantizing values."""
+
+    def replace(path: str, module: nn.Module):
+        params = class_predicate(path, module)
+        if not params:
+            return module
+        if params is True:
+            raise ValueError("quantized checkpoint slots require explicit group_size and bits")
+
+        group_size = int(params["group_size"])
+        bits = int(params["bits"])
+        if isinstance(module, nn.Linear):
+            slot = nn.QuantizedLinear.__new__(nn.QuantizedLinear)
+            nn.Module.__init__(slot)
+            slot.group_size = group_size
+            slot.bits = bits
+            slot.mode = "affine"
+            slot.weight = mx.zeros((1,), dtype=mx.uint32)
+            slot.scales = mx.zeros((1,), dtype=mx.float16)
+            slot.biases = mx.zeros((1,), dtype=mx.float16)
+            if "bias" in module:
+                slot.bias = module.bias
+        elif isinstance(module, nn.Embedding):
+            slot = nn.QuantizedEmbedding.__new__(nn.QuantizedEmbedding)
+            nn.Module.__init__(slot)
+            slot.group_size = group_size
+            slot.bits = bits
+            slot.mode = "affine"
+            slot.weight = mx.zeros((1,), dtype=mx.uint32)
+            slot.scales = mx.zeros((1,), dtype=mx.float16)
+            slot.biases = mx.zeros((1,), dtype=mx.float16)
+            slot.num_embeddings, slot.dims = module.weight.shape
+        else:
+            raise TypeError(f"Cannot make a quantized checkpoint slot for {type(module).__name__}")
+        slot.freeze()
+        return slot
+
+    leaves = model.leaf_modules()
+    leaves = tree_map_with_path(replace, leaves, is_leaf=nn.Module.is_module)
+    model.update_modules(leaves)
+
+
 def apply_quantization_structure(model, config: QuantConfig) -> None:
     """Convert the module tree to quantized layers *without* meaningful weights.
 
@@ -123,12 +166,7 @@ def apply_quantization_structure(model, config: QuantConfig) -> None:
     those carry packed weights plus scales and biases under different names than `nn.Linear`. This
     replays the recorded recipe so the keys line up; the values are then overwritten by the load.
     """
-    nn.quantize(
-        model,
-        group_size=config.group_size,
-        bits=config.bits,
-        class_predicate=_class_predicate(config),
-    )
+    apply_quantized_slots(model, _class_predicate(config))
 
 
 def quantize_dit(model, config: QuantConfig | None = None, verbose: bool = False) -> dict[str, object]:

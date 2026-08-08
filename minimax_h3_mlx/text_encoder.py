@@ -85,25 +85,27 @@ class MiniMaxH3TextEncoder:
         self.quantized = quant_path.exists()
         if self.quantized:
             import mlx.nn as nn
+            from .quantize import apply_quantized_slots
 
             with quant_path.open() as handle:
                 quant = json.load(handle)
 
             def quantize_language(path, module):
                 weight = getattr(module, "weight", None)
-                return (
+                should_quantize = (
                     hasattr(module, "to_quantized")
                     and isinstance(weight, mx.array)
                     and weight.ndim == 2
                     and weight.shape[-1] % int(quant["group_size"]) == 0
                 )
+                if not should_quantize:
+                    return False
+                return {
+                    "group_size": int(quant["group_size"]),
+                    "bits": int(quant["bits"]),
+                }
 
-            nn.quantize(
-                self.language,
-                group_size=int(quant["group_size"]),
-                bits=int(quant["bits"]),
-                class_predicate=quantize_language,
-            )
+            apply_quantized_slots(self.language, quantize_language)
         self._load_weights(model_dir, dtype, verbose)
 
         self.image_token_id = raw["image_token_id"]
@@ -143,13 +145,15 @@ class MiniMaxH3TextEncoder:
         if not shards:
             raise FileNotFoundError(f"No safetensors in {model_dir}.")
 
-        buckets: dict[str, dict[str, mx.array]] = {"language": {}, "vision": {}}
         expected = {
             "language": {k for k, _ in tree_flatten(self.language.parameters())},
             "vision": set() if self.vision is None else {k for k, _ in tree_flatten(self.vision.parameters())},
         }
+        remaining = {bucket: set(keys) for bucket, keys in expected.items()}
+        loaded = 0
         skipped = 0
         for shard in shards:
+            updates: dict[str, list[tuple[str, mx.array]]] = {"language": [], "vision": []}
             for key, tensor in mx.load(shard).items():
                 target = self._wanted(key)
                 if target is None:
@@ -159,22 +163,26 @@ class MiniMaxH3TextEncoder:
                 if path not in expected[bucket]:
                     skipped += 1
                     continue
-                buckets[bucket][path] = tensor if self.quantized else tensor.astype(dtype)
-            if verbose:
-                print(f"  {Path(shard).name}: kept {len(buckets['language']) + len(buckets['vision'])}")
+                updates[bucket].append(
+                    (path, tensor if self.quantized else tensor.astype(dtype))
+                )
+                remaining[bucket].discard(path)
+                loaded += 1
 
-        for bucket, module in (("language", self.language), ("vision", self.vision)):
-            if module is None:
-                continue
-            missing = sorted(expected[bucket] - buckets[bucket].keys())
+            for bucket, module in (("language", self.language), ("vision", self.vision)):
+                if module is None or not updates[bucket]:
+                    continue
+                module.update(tree_unflatten(updates[bucket]))
+                mx.eval(*(tensor for _, tensor in updates[bucket]))
+            if verbose:
+                print(f"  {Path(shard).name}: {loaded} tensors loaded")
+
+        for bucket in ("language", "vision"):
+            missing = sorted(remaining[bucket])
             if missing:
                 raise KeyError(
                     f"{bucket} encoder missing {len(missing)} tensors, e.g. {missing[:4]}."
                 )
-            module.update(tree_unflatten(list(buckets[bucket].items())))
-        mx.eval(self.language.parameters())
-        if self.vision is not None:
-            mx.eval(self.vision.parameters())
         self.skipped_tensors = skipped
 
     # -- tokenizer / processor -------------------------------------------------------------

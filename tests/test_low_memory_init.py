@@ -7,11 +7,13 @@ import tempfile
 from dataclasses import asdict
 from pathlib import Path
 
+import mlx.core as mx
+
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from minimax_h3_mlx.config import DiTConfig
-from minimax_h3_mlx.pipeline import MiniMaxH3Pipeline
+from minimax_h3_mlx.pipeline import MiniMaxH3Pipeline, detach_bfloat16
 
 
 def write_metadata(root: Path) -> tuple[Path, Path]:
@@ -73,6 +75,11 @@ def write_metadata(root: Path) -> tuple[Path, Path]:
 
 
 def main() -> None:
+    source = mx.arange(6).reshape(2, 3).astype(mx.bfloat16)
+    detached = detach_bfloat16(source)
+    assert detached.dtype == mx.bfloat16
+    assert mx.array_equal(detached, source).item()
+
     with tempfile.TemporaryDirectory() as directory:
         root = Path(directory)
         text, dit = write_metadata(root)

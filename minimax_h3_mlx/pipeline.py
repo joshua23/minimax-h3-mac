@@ -55,6 +55,14 @@ class GenerationResult:
     block_cache_stats: dict[str, int | float] | None = None
 
 
+def detach_bfloat16(array: mx.array) -> mx.array:
+    """Materialize a small BF16 result independently of its phase-owned model graph."""
+    host = np.array(array.astype(mx.float16), copy=True)
+    detached = mx.array(host).astype(mx.bfloat16)
+    mx.eval(detached)
+    return detached
+
+
 class MiniMaxH3Pipeline:
     """Joint video + audio generation."""
 
@@ -317,7 +325,7 @@ class MiniMaxH3Pipeline:
         # 1. Text conditioning. Keyframe vision blocks come back tagged as *video* rows.
         prompt_embeds, text_token_tags = self.text_encoder.encode(prompt, images)
         if self._low_memory:
-            prompt_embeds = mx.array(np.array(prompt_embeds), dtype=mx.bfloat16)
+            prompt_embeds = detach_bfloat16(prompt_embeds)
             text_token_tags = np.array(text_token_tags, copy=True)
             self._release_component("text_encoder")
 

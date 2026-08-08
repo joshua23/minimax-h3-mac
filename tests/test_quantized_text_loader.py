@@ -111,7 +111,14 @@ def main() -> None:
         source.mkdir()
         write_source(source, source_model)
         convert(source, output, num_layers=1)
-        encoder = MiniMaxH3TextEncoder(output, num_layers=1, load_vision=False)
+        original_quantize = mx.quantize
+        mx.quantize = lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("quantized checkpoint loading must not quantize random weights")
+        )
+        try:
+            encoder = MiniMaxH3TextEncoder(output, num_layers=1, load_vision=False)
+        finally:
+            mx.quantize = original_quantize
         actual = encoder.language(input_ids)
         mx.eval(actual)
 

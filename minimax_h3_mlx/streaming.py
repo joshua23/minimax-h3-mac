@@ -10,7 +10,12 @@ from mlx.utils import tree_flatten, tree_unflatten
 
 from .config import DiTConfig
 from .dit import MiniMaxH3DiT, TransformerBlock
-from .quantize import QuantConfig, _class_predicate, apply_quantization_structure
+from .quantize import (
+    QuantConfig,
+    _class_predicate,
+    apply_quantization_structure,
+    apply_quantized_slots,
+)
 
 
 class _BlockSlot(nn.Module):
@@ -111,12 +116,7 @@ def load_streaming_dit(
             return False
         return predicate(path, module)
 
-    nn.quantize(
-        model,
-        group_size=provider.quantization.group_size,
-        bits=provider.quantization.bits,
-        class_predicate=static_predicate,
-    )
+    apply_quantized_slots(model, static_predicate)
 
     expected = {
         key
