@@ -101,7 +101,7 @@ def load_streaming_dit(
     """Load static DiT weights and leave the 50 main blocks file-backed."""
     model_dir = Path(model_dir)
     provider = QuantizedBlockProvider(model_dir)
-    model = MiniMaxH3DiT(provider.config)
+    model = MiniMaxH3DiT(provider.config, build_blocks=False)
 
     # Quantize token-refiner linears so the non-block checkpoint keys match.
     predicate = _class_predicate(provider.quantization)

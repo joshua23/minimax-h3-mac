@@ -300,7 +300,7 @@ class MiniMaxH3DiT(nn.Module):
     position grid, per-row modality tags and per-row timestep indices. See ``packing.py``.
     """
 
-    def __init__(self, config: DiTConfig):
+    def __init__(self, config: DiTConfig, *, build_blocks: bool = True):
         super().__init__()
         self.config = config
 
@@ -316,7 +316,11 @@ class MiniMaxH3DiT(nn.Module):
         self.token_refiner = TokenRefiner(config)
 
         # 4. The block stack.
-        self.blocks = [TransformerBlock(config) for _ in range(config.num_layers)]
+        self.blocks = (
+            [TransformerBlock(config) for _ in range(config.num_layers)]
+            if build_blocks
+            else []
+        )
 
         # 5. Shared output norm and the two per-modality heads. Both heads run over every row;
         #    the rows of each modality are selected afterwards.
@@ -415,12 +419,13 @@ class MiniMaxH3DiT(nn.Module):
                     mx.eval(hidden)
             return hidden
 
+        block_count = block_provider.block_count if block_provider is not None else len(self.blocks)
         if block_cache is None:
-            x = run_range(x, 0, len(self.blocks))
+            x = run_range(x, 0, block_count)
         else:
             x = block_cache.run(
                 x,
-                block_count=len(self.blocks),
+                block_count=block_count,
                 run_range=run_range,
                 sigma=block_cache_sigma,
                 step_index=block_cache_step,

@@ -108,6 +108,7 @@ def main() -> None:
         root = Path(directory)
         write_checkpoint(root, eager, cfg)
         streamed, provider = load_streaming_dit(root)
+        assert not any(key.startswith("blocks.") for key, _ in tree_flatten(streamed.parameters()))
         cache = ModulationCache.build_streaming(streamed, provider, args[3], dtype=mx.float32)
         got_v, got_a = streamed(
             *args,
