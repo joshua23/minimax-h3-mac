@@ -82,7 +82,8 @@ class MiniMaxH3TextEncoder:
         self.language = Qwen3VLModel(self.text_config)
         self.vision = VisionModel(self.vision_config) if load_vision else None
         quant_path = model_dir / "quant_config.json"
-        if quant_path.exists():
+        self.quantized = quant_path.exists()
+        if self.quantized:
             import mlx.nn as nn
 
             with quant_path.open() as handle:
@@ -158,7 +159,7 @@ class MiniMaxH3TextEncoder:
                 if path not in expected[bucket]:
                     skipped += 1
                     continue
-                buckets[bucket][path] = tensor.astype(dtype)
+                buckets[bucket][path] = tensor if self.quantized else tensor.astype(dtype)
             if verbose:
                 print(f"  {Path(shard).name}: kept {len(buckets['language']) + len(buckets['vision'])}")
 
