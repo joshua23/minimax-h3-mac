@@ -426,6 +426,7 @@ class ViTDecoder3d(nn.Module):
 
         for block in self.transformer_blocks:
             tokens = block(tokens, rotary)
+            mx.eval(tokens)
 
         tokens = self.proj_out(self.norm_out(tokens))[:, :num_patches, :]
 
@@ -537,7 +538,9 @@ class VideoVAE(nn.Module):
             row = []
             for j_pos, j_len in zip(x_idx, x_len):
                 tile = x[:, :, i_pos : i_pos + i_len, j_pos : j_pos + j_len, :]
-                row.append(self.quant_conv(self.encoder(tile)))
+                encoded = self.quant_conv(self.encoder(tile))
+                mx.eval(encoded)
+                row.append(encoded)
             rows.append(row)
 
         ratio = self.config.spatial_compression_ratio
@@ -562,7 +565,9 @@ class VideoVAE(nn.Module):
                     j_pos // ratio : j_pos // ratio + j_len // ratio,
                     :,
                 ]
-                row.append(self.decoder(self.post_quant_conv(tile)))
+                decoded = self.decoder(self.post_quant_conv(tile))
+                mx.eval(decoded)
+                row.append(decoded)
             rows.append(row)
         return self._stitch_tiles(rows, y_ov, x_ov, 2, 3)
 
