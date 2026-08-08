@@ -17,6 +17,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from minimax_h3_mlx.media import save_frames, save_mp4, save_wav
+from minimax_h3_mlx.block_cache import BlockCacheConfig
 from minimax_h3_mlx.pipeline import MiniMaxH3Pipeline
 
 DEFAULT_CHECKPOINT = "/Volumes/models/MiniMax-H3/FL2VA"
@@ -41,6 +42,14 @@ def main() -> int:
                         help="anchor for each --image, in order")
     parser.add_argument("--keep-adaln", action="store_true",
                         help="keep the 13B adaln_proj resident instead of caching and dropping it")
+    parser.add_argument("--block-cache", action="store_true",
+                        help="reuse trailing-block residuals on eligible denoising steps")
+    parser.add_argument("--block-cache-threshold", type=float, default=0.12,
+                        help="maximum adjacent sigma delta for block-cache reuse")
+    parser.add_argument("--block-cache-depth", type=float, default=0.75,
+                        help="fraction of trailing transformer blocks served from cache")
+    parser.add_argument("--block-cache-max-consecutive", type=int, default=2,
+                        help="maximum cached steps before a forced full refresh")
     args = parser.parse_args()
 
     images = None
@@ -66,6 +75,15 @@ def main() -> int:
         height=args.height,
         width=args.width,
         drop_adaln=not args.keep_adaln,
+        block_cache_config=(
+            BlockCacheConfig(
+                sigma_threshold=args.block_cache_threshold,
+                max_consecutive=args.block_cache_max_consecutive,
+                cache_depth=args.block_cache_depth,
+            )
+            if args.block_cache
+            else None
+        ),
     )
 
     output = Path(args.output)
@@ -79,6 +97,14 @@ def main() -> int:
         save_wav(output.with_suffix(".wav"), result.audio, result.sample_rate)
 
     print(f"{result.seconds_per_step:.1f}s per step, {result.total_seconds / 60:.1f} min total")
+    if result.block_cache_stats is not None:
+        stats = result.block_cache_stats
+        print(
+            "block cache: "
+            f"full={stats['full_steps']} cached={stats['cache_steps']} "
+            f"skipped={stats['skipped_blocks']} blocks "
+            f"({100.0 * stats['saved_fraction']:.1f}% of block executions)"
+        )
     return 0
 
 

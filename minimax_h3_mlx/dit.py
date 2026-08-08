@@ -30,6 +30,7 @@ import math
 import mlx.core as mx
 import mlx.nn as nn
 
+from .block_cache import BlockResidualCache
 from .config import MODALITY_NUM, DiTConfig
 
 
@@ -338,6 +339,10 @@ class MiniMaxH3DiT(nn.Module):
         text_indices: mx.array,
         modulation_cache: "ModulationCache | None" = None,
         mask: mx.array | None = None,
+        block_cache: BlockResidualCache | None = None,
+        block_cache_sigma: float = 0.0,
+        block_cache_step: int = 0,
+        block_cache_total_steps: int = 1,
     ) -> tuple[mx.array, mx.array]:
         """Predict the video and audio velocity for one packed sequence.
 
@@ -388,11 +393,28 @@ class MiniMaxH3DiT(nn.Module):
         #    carry tag -1 and must not index backwards. They never reach the outputs.
         adaln_indices = timestep_indices * MODALITY_NUM + mx.maximum(token_tags, 0)
 
-        for i, block in enumerate(self.blocks):
-            modulation = (
-                modulation_cache.get(i) if modulation_cache is not None else block.adaln_proj(temb)
+        def run_range(hidden: mx.array, start: int, end: int) -> mx.array:
+            for i in range(start, end):
+                block = self.blocks[i]
+                modulation = (
+                    modulation_cache.get(i)
+                    if modulation_cache is not None
+                    else block.adaln_proj(temb)
+                )
+                hidden = block(hidden, modulation, adaln_indices, rotary, mask)
+            return hidden
+
+        if block_cache is None:
+            x = run_range(x, 0, len(self.blocks))
+        else:
+            x = block_cache.run(
+                x,
+                block_count=len(self.blocks),
+                run_range=run_range,
+                sigma=block_cache_sigma,
+                step_index=block_cache_step,
+                total_steps=block_cache_total_steps,
             )
-            x = block(x, modulation, adaln_indices, rotary, mask)
 
         # 4. Both heads run over every row, then each modality's rows are selected.
         x = self.final_layer.norm_out(x, temb, timestep_indices)

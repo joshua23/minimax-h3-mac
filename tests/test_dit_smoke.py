@@ -10,6 +10,7 @@ import mlx.core as mx
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from minimax_h3_mlx.adaln import ModulationCache, drop_adaln_weights, schedule_timesteps
+from minimax_h3_mlx.block_cache import BlockCacheConfig, BlockResidualCache
 from minimax_h3_mlx.config import TAG_AUDIO, TAG_TEXT, TAG_VIDEO, DiTConfig
 from minimax_h3_mlx.dit import MiniMaxH3DiT
 
@@ -124,6 +125,43 @@ def test_schedule_timesteps():
     print(f"schedule timesteps: {ts.tolist()}")
 
 
+def test_block_cache_disabled_is_exact_and_enabled_skips_tail():
+    dit, _cfg, args = test_forward_shapes()
+    baseline_v, baseline_a = dit(*args)
+    disabled = BlockResidualCache(BlockCacheConfig(sigma_threshold=0.0))
+    disabled_v, disabled_a = dit(*args, block_cache=disabled)
+    mx.eval(baseline_v, baseline_a, disabled_v, disabled_a)
+    assert float(mx.max(mx.abs(baseline_v - disabled_v)).item()) == 0.0
+    assert float(mx.max(mx.abs(baseline_a - disabled_a)).item()) == 0.0
+
+    cache = BlockResidualCache(
+        BlockCacheConfig(
+            sigma_threshold=1.0,
+            start_percent=0.0,
+            end_percent=1.0,
+            max_consecutive=2,
+            cache_depth=0.5,
+        )
+    )
+    for step, sigma in enumerate((1.0, 0.9, 0.8, 0.0)):
+        video, audio = dit(
+            *args,
+            block_cache=cache,
+            block_cache_sigma=sigma,
+            block_cache_step=step,
+            block_cache_total_steps=4,
+        )
+        mx.eval(video, audio)
+        assert not mx.any(mx.isnan(video)).item()
+        assert not mx.any(mx.isnan(audio)).item()
+
+    stats = cache.stats()
+    assert stats["full_steps"] == 2, stats
+    assert stats["cache_steps"] == 2, stats
+    assert stats["skipped_blocks"] == 2, stats
+    print(f"block cache: {stats}")
+
+
 def _flatten(tree, prefix=""):
     if isinstance(tree, dict):
         for k, v in tree.items():
@@ -138,4 +176,5 @@ def _flatten(tree, prefix=""):
 if __name__ == "__main__":
     test_schedule_timesteps()
     test_modulation_cache_matches_live_projection()
+    test_block_cache_disabled_is_exact_and_enabled_skips_tail()
     print("\nall smoke tests passed")

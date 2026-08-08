@@ -22,6 +22,7 @@ import mlx.core as mx
 import numpy as np
 
 from .adaln import ModulationCache, drop_adaln_weights
+from .block_cache import BlockCacheConfig, BlockResidualCache
 from .config import PipelineConfig
 from .packing import (
     AUDIO_CHANNELS,
@@ -50,6 +51,7 @@ class GenerationResult:
     fps: int = FPS
     seconds_per_step: float = 0.0
     total_seconds: float = 0.0
+    block_cache_stats: dict[str, int | float] | None = None
 
 
 class MiniMaxH3Pipeline:
@@ -220,6 +222,7 @@ class MiniMaxH3Pipeline:
         height: int | None = None,
         width: int | None = None,
         drop_adaln: bool = True,
+        block_cache_config: BlockCacheConfig | None = None,
         verbose: bool = True,
     ) -> GenerationResult:
         """Generate a clip.
@@ -297,6 +300,11 @@ class MiniMaxH3Pipeline:
         n_cond_v = layout.num_condition_video_rows
         n_cond_a = layout.num_condition_audio_rows
         embeds = prompt_embeds.astype(mx.bfloat16)
+        block_cache = (
+            BlockResidualCache(block_cache_config)
+            if block_cache_config is not None
+            else None
+        )
 
         # 6. Denoise. One forward per step; only generated rows are written back, so the
         #    conditioning anchors survive without any masking.
@@ -315,6 +323,10 @@ class MiniMaxH3Pipeline:
                 layout.audio_indices,
                 layout.text_indices,
                 modulation_cache=self._cache,
+                block_cache=block_cache,
+                block_cache_sigma=float(video_sched.sigmas[i].item()),
+                block_cache_step=i,
+                block_cache_total_steps=len(video_sched.timesteps),
             )
             # Rebind rather than assign into a slice: the stepped result is a lazy graph reading the
             # very rows it would overwrite, and with conditioning rows present the two halves must
@@ -352,6 +364,7 @@ class MiniMaxH3Pipeline:
             sample_rate=self.audio_vae.config.sampling_rate,
             seconds_per_step=sum(step_times) / max(len(step_times), 1),
             total_seconds=total,
+            block_cache_stats=block_cache.stats() if block_cache is not None else None,
         )
 
     # -- decoding -----------------------------------------------------------------------------
