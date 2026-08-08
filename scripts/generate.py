@@ -42,6 +42,14 @@ def main() -> int:
                         help="anchor for each --image, in order")
     parser.add_argument("--keep-adaln", action="store_true",
                         help="keep the 13B adaln_proj resident instead of caching and dropping it")
+    parser.add_argument("--stream-blocks", action="store_true",
+                        help="load one quantized DiT block at a time from safetensors")
+    parser.add_argument("--low-memory", action="store_true",
+                        help="stage text encoder, streamed DiT, video VAE and audio VAE")
+    parser.add_argument("--text-encoder", default=None,
+                        help="quantized H3 text encoder directory for --low-memory")
+    parser.add_argument("--memory-limit-gb", type=float, default=16.0,
+                        help="MLX allocation guideline for --low-memory")
     parser.add_argument("--block-cache", action="store_true",
                         help="reuse trailing-block residuals on eligible denoising steps")
     parser.add_argument("--block-cache-threshold", type=float, default=0.12,
@@ -62,7 +70,13 @@ def main() -> int:
         parser.error(f"--anchor must be given once per --image ({len(images)} images, {len(anchors)} anchors)")
 
     pipe = MiniMaxH3Pipeline.from_pretrained(
-        args.checkpoint, transformer_dir=args.transformer, load_vision=bool(images)
+        args.checkpoint,
+        transformer_dir=args.transformer,
+        load_vision=bool(images),
+        stream_blocks=args.stream_blocks or args.low_memory,
+        low_memory=args.low_memory,
+        text_encoder_dir=args.text_encoder,
+        memory_limit_gb=args.memory_limit_gb,
     )
     result = pipe(
         args.prompt,

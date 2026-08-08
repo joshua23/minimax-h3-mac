@@ -76,6 +76,26 @@ class ModulationCache:
             tables.append(table)
         return cls(tables, timesteps)
 
+    @classmethod
+    def build_streaming(
+        cls,
+        dit,
+        block_provider,
+        timesteps: mx.array,
+        dtype: mx.Dtype = mx.bfloat16,
+    ) -> "ModulationCache":
+        """Build the table by loading only one block's AdaLN weights at a time."""
+        temb = dit.time_embedder(timestep_embedding(timesteps, dit.config.timestep_input_dim))
+        mx.eval(temb)
+
+        tables: list[tuple[mx.array, ...]] = []
+        for index in range(block_provider.block_count):
+            block = block_provider.load_block(index, adaln_only=True)
+            table = tuple(t.astype(dtype) for t in block.adaln_proj(temb))
+            mx.eval(table)
+            tables.append(table)
+        return cls(tables, timesteps)
+
 
 def final_layer_modulation(dit, timesteps: mx.array, dtype: mx.Dtype = mx.bfloat16):
     """Precompute the output layer's ``shift``/``scale`` table.

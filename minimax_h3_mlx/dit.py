@@ -343,6 +343,7 @@ class MiniMaxH3DiT(nn.Module):
         block_cache_sigma: float = 0.0,
         block_cache_step: int = 0,
         block_cache_total_steps: int = 1,
+        block_provider: "QuantizedBlockProvider | None" = None,
     ) -> tuple[mx.array, mx.array]:
         """Predict the video and audio velocity for one packed sequence.
 
@@ -395,13 +396,23 @@ class MiniMaxH3DiT(nn.Module):
 
         def run_range(hidden: mx.array, start: int, end: int) -> mx.array:
             for i in range(start, end):
-                block = self.blocks[i]
+                block = (
+                    block_provider.load_block(
+                        i,
+                        include_adaln=modulation_cache is None,
+                    )
+                    if block_provider is not None
+                    else self.blocks[i]
+                )
                 modulation = (
                     modulation_cache.get(i)
                     if modulation_cache is not None
                     else block.adaln_proj(temb)
                 )
                 hidden = block(hidden, modulation, adaln_indices, rotary, mask)
+                if block_provider is not None:
+                    # Materialize before the reusable slot is rebound to the next block.
+                    mx.eval(hidden)
             return hidden
 
         if block_cache is None:
@@ -421,3 +432,9 @@ class MiniMaxH3DiT(nn.Module):
         video_out = self.final_layer.video_out(x.astype(param_dtype(self.final_layer.video_out)))
         audio_out = self.final_layer.audio_out(x.astype(param_dtype(self.final_layer.audio_out)))
         return video_out[:, video_indices], audio_out[:, audio_indices]
+
+
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from .streaming import QuantizedBlockProvider

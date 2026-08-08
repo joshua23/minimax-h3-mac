@@ -140,6 +140,36 @@ def load_dit(
     return model
 
 
+def read_video_vae_config(model_dir: str | Path):
+    """Read Video VAE metadata without allocating model weights."""
+    from .video_vae import VideoVAEConfig
+
+    model_dir = Path(model_dir)
+    with open(model_dir / "config.json") as handle:
+        wrapper = json.load(handle)
+    with open(model_dir / "source" / "config.json") as handle:
+        source = json.load(handle)
+    channels = source["ch"]
+    return VideoVAEConfig(
+        in_channels=source["in_channels"],
+        out_channels=source["out_ch"],
+        latent_channels=source["z_channels"],
+        block_out_channels=tuple(channels * multiplier for multiplier in source["ch_mult"]),
+        layers_per_block=source["num_res_blocks"],
+        spatial_downsample_factors=tuple(source["space_down"]),
+        temporal_downsample_factors=tuple(source["time_down"]),
+        decoder_num_layers=source["vit_decoder_kwargs"]["num_layers"],
+        decoder_num_attention_heads=source["vit_decoder_kwargs"]["heads"],
+        decoder_attention_head_dim=source["vit_decoder_kwargs"]["dim_head"],
+        decoder_rope_theta=source["vit_decoder_kwargs"]["rope_theta"],
+        decoder_rope_dim_ratio=source["vit_decoder_kwargs"]["rope_dim_ratio"],
+        clip_length=wrapper.get("vae_clip_length", 17),
+        token_drop=wrapper.get("vae_token_drop", 3),
+        latents_mean=tuple(wrapper.get("latents_mean", ())),
+        latents_std=tuple(wrapper.get("latents_std", ())),
+    )
+
+
 def load_video_vae(model_dir: str | Path, strict: bool = True):
     """Load the video VAE from a released ``video_vae/`` directory.
 
@@ -209,6 +239,28 @@ def load_video_vae(model_dir: str | Path, strict: bool = True):
     model.update(tree_unflatten(list(weights.items())))
     mx.eval(model.parameters())
     return model
+
+
+def read_audio_vae_config(model_dir: str | Path):
+    """Read Audio VAE metadata without allocating model weights."""
+    from .audio_vae import AudioVAEConfig
+
+    model_dir = Path(model_dir)
+    with open(model_dir / "metadata.json") as handle:
+        kwargs = json.load(handle)["metadata"]["kwargs"]
+    with open(model_dir / "config.json") as handle:
+        wrapper = json.load(handle)
+    return AudioVAEConfig(
+        encoder_dim=kwargs["encoder_dim"],
+        encoder_rates=tuple(kwargs["encoder_rates"]),
+        latent_dim=kwargs["latent_dim"],
+        latent_channels=kwargs["vae_latent_channels"],
+        decoder_dim=kwargs["decoder_dim"],
+        decoder_rates=tuple(kwargs["decoder_rates"]),
+        sampling_rate=kwargs["sample_rate"],
+        latents_mean=tuple(wrapper.get("latents_mean", ())),
+        latents_std=tuple(wrapper.get("latents_std", ())),
+    )
 
 
 def load_audio_vae(model_dir: str | Path, strict: bool = True):

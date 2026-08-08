@@ -14,6 +14,7 @@ the 13B of `adaln_proj` is then dropped — see :mod:`minimax_h3_mlx.adaln`.
 
 from __future__ import annotations
 
+import gc
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -23,7 +24,7 @@ import numpy as np
 
 from .adaln import ModulationCache, drop_adaln_weights
 from .block_cache import BlockCacheConfig, BlockResidualCache
-from .config import PipelineConfig
+from .config import DiTConfig, PipelineConfig
 from .packing import (
     AUDIO_CHANNELS,
     FPS,
@@ -72,6 +73,14 @@ class MiniMaxH3Pipeline:
         self.config = config or PipelineConfig()
         self._cache: ModulationCache | None = None
         self._cache_timesteps: tuple[float, ...] | None = None
+        self._block_provider = None
+        self._low_memory = False
+        self._checkpoint_root: Path | None = None
+        self._dit_path: Path | None = None
+        self._text_encoder_path: Path | None = None
+        self._dit_config = getattr(dit, "config", None)
+        self._video_config = getattr(video_vae, "config", None)
+        self._audio_config = getattr(audio_vae, "config", None)
 
     @classmethod
     def from_pretrained(
@@ -80,6 +89,10 @@ class MiniMaxH3Pipeline:
         transformer_dir: str | Path | None = None,
         dtype: mx.Dtype = mx.bfloat16,
         load_vision: bool = False,
+        stream_blocks: bool = False,
+        low_memory: bool = False,
+        text_encoder_dir: str | Path | None = None,
+        memory_limit_gb: float = 16.0,
         verbose: bool = True,
     ) -> "MiniMaxH3Pipeline":
         """Load a released ``FL2VA/`` (or ``Ref2VA/``) directory.
@@ -91,12 +104,41 @@ class MiniMaxH3Pipeline:
                 transformer, and everything else still comes from upstream. ``load_dit`` picks up
                 the recorded recipe from its ``quant_config.json`` automatically.
         """
-        from .load import load_audio_vae, load_dit, load_video_vae
+        from .load import (
+            load_audio_vae,
+            load_dit,
+            load_video_vae,
+            read_audio_vae_config,
+            read_video_vae_config,
+        )
+        from .streaming import load_streaming_dit
         from .text_encoder import MiniMaxH3TextEncoder
 
         root = Path(checkpoint_dir)
         dit_path = Path(transformer_dir) if transformer_dir else root / "transformer"
         config = PipelineConfig.from_model_index(root / "model_index.json")
+
+        if low_memory:
+            mx.set_cache_limit(0)
+            mx.set_memory_limit(int(memory_limit_gb * 1e9))
+            text_path = Path(text_encoder_dir) if text_encoder_dir else root / "text_encoder-mlx-4bit"
+            if not (text_path / "quant_config.json").is_file():
+                raise FileNotFoundError(
+                    f"low-memory mode requires a quantized text encoder at {text_path}"
+                )
+            if not (dit_path / "quant_config.json").is_file():
+                raise FileNotFoundError(
+                    f"low-memory mode requires a quantized transformer at {dit_path}"
+                )
+            pipeline = cls(None, None, None, None, config)
+            pipeline._low_memory = True
+            pipeline._checkpoint_root = root
+            pipeline._dit_path = dit_path
+            pipeline._text_encoder_path = text_path
+            pipeline._dit_config = DiTConfig.from_json(dit_path / "config.json")
+            pipeline._video_config = read_video_vae_config(root / "video_vae")
+            pipeline._audio_config = read_audio_vae_config(root / "audio_vae")
+            return pipeline
 
         def step(label, fn):
             started = time.perf_counter()
@@ -110,10 +152,26 @@ class MiniMaxH3Pipeline:
         text_encoder = step(
             "text encoder", lambda: MiniMaxH3TextEncoder(root / "text_encoder", dtype=dtype, load_vision=load_vision)
         )
-        dit = step(f"transformer ({dit_path.name})", lambda: load_dit(dit_path))
+        if stream_blocks:
+            dit, block_provider = step(
+                f"streaming transformer ({dit_path.name})",
+                lambda: load_streaming_dit(dit_path, verbose=verbose),
+            )
+        else:
+            dit = step(f"transformer ({dit_path.name})", lambda: load_dit(dit_path))
+            block_provider = None
         video_vae = step("video vae", lambda: load_video_vae(root / "video_vae"))
         audio_vae = step("audio vae", lambda: load_audio_vae(root / "audio_vae"))
-        return cls(dit, text_encoder, video_vae, audio_vae, config)
+        pipeline = cls(dit, text_encoder, video_vae, audio_vae, config)
+        pipeline._block_provider = block_provider
+        return pipeline
+
+    def _release_component(self, name: str) -> None:
+        """Drop one phase-owned component and return cached Metal buffers."""
+        setattr(self, name, None)
+        gc.collect()
+        mx.synchronize()
+        mx.clear_cache()
 
     # -- schedule -----------------------------------------------------------------------------
 
@@ -151,12 +209,20 @@ class MiniMaxH3Pipeline:
         if self._cache is not None and self._cache_timesteps == key:
             return
         started = time.perf_counter()
-        self._cache = ModulationCache.build(self.dit, timesteps, dtype=mx.bfloat16)
+        if self._block_provider is None:
+            self._cache = ModulationCache.build(self.dit, timesteps, dtype=mx.bfloat16)
+        else:
+            self._cache = ModulationCache.build_streaming(
+                self.dit,
+                self._block_provider,
+                timesteps,
+                dtype=mx.bfloat16,
+            )
         self._cache_timesteps = key
         if verbose:
             print(f"  adaln cache: {len(key)} timesteps, {self._cache.nbytes() / 1e6:.0f} MB "
                   f"in {time.perf_counter() - started:.1f}s")
-        if drop_adaln:
+        if drop_adaln and self._block_provider is None:
             freed = drop_adaln_weights(self.dit)
             mx.eval(self.dit.parameters())
             if verbose:
@@ -182,7 +248,7 @@ class MiniMaxH3Pipeline:
         """
         from .packing import KEYFRAME_ENCODE_SEED, prepare_keyframe_image
 
-        cfg = self.video_vae.config
+        cfg = self._video_config
         latents_mean = mx.array(np.array(cfg.latents_mean, np.float32)).reshape(1, -1, 1, 1, 1)
         latents_std = mx.array(np.array(cfg.latents_std, np.float32)).reshape(1, -1, 1, 1, 1)
         pixel_mean = np.array(PIXEL_MEAN, np.float32).reshape(1, 3, 1, 1, 1)
@@ -205,7 +271,7 @@ class MiniMaxH3Pipeline:
             # -> (1, C, 1, H', W'), then the float16 round trip the reference relies on.
             latent = latent.transpose(0, 4, 1, 2, 3).astype(mx.float16).astype(mx.float32)
             normalized = (latent - latents_mean) / latents_std
-            rows.append(patchify_video_latents(normalized, self.dit.config.patch_size))
+            rows.append(patchify_video_latents(normalized, self._dit_config.patch_size))
         return mx.concatenate(rows)
 
     # -- generation ---------------------------------------------------------------------------
@@ -237,8 +303,30 @@ class MiniMaxH3Pipeline:
         """
         run_started = time.perf_counter()
 
+        if self._low_memory and images:
+            raise NotImplementedError("low-memory mode currently supports text-to-video only")
+        if self._low_memory:
+            from .text_encoder import MiniMaxH3TextEncoder
+
+            self.text_encoder = MiniMaxH3TextEncoder(
+                self._text_encoder_path,
+                load_vision=False,
+                verbose=verbose,
+            )
+
         # 1. Text conditioning. Keyframe vision blocks come back tagged as *video* rows.
         prompt_embeds, text_token_tags = self.text_encoder.encode(prompt, images)
+        if self._low_memory:
+            prompt_embeds = mx.array(np.array(prompt_embeds), dtype=mx.bfloat16)
+            text_token_tags = np.array(text_token_tags, copy=True)
+            self._release_component("text_encoder")
+
+            from .streaming import load_streaming_dit
+
+            self.dit, self._block_provider = load_streaming_dit(
+                self._dit_path,
+                verbose=verbose,
+            )
 
         # 2. Geometry.
         if height is None or width is None:
@@ -247,10 +335,10 @@ class MiniMaxH3Pipeline:
             raise ValueError(f"`height` and `width` must be multiples of 32, got {height}x{width}.")
         num_frames = align_num_frames(int(round(duration_seconds * FPS)))
         num_latent_frames = video_latent_num_frames(num_frames)
-        ratio = self.video_vae.config.spatial_compression_ratio
+        ratio = self._video_config.spatial_compression_ratio
         latent_height, latent_width = height // ratio, width // ratio
         num_audio_latents = audio_latent_num_frames(num_frames)
-        patch_size = self.dit.config.patch_size
+        patch_size = self._dit_config.patch_size
 
         layout = build_packed_sequence(
             text_token_tags,
@@ -283,11 +371,11 @@ class MiniMaxH3Pipeline:
             )
 
         latents = mx.random.normal(
-            (1, self.video_vae.config.latent_channels, num_latent_frames, latent_height, latent_width)
+            (1, self._video_config.latent_channels, num_latent_frames, latent_height, latent_width)
         ).astype(mx.float32)
         video_rows = patchify_video_latents(latents, patch_size)
         audio_rows = mx.random.normal(
-            (num_audio_latents * AUDIO_CHANNELS, self.audio_vae.config.latent_channels)
+            (num_audio_latents * AUDIO_CHANNELS, self._audio_config.latent_channels)
         ).astype(mx.float32)
         if condition_rows is not None:
             video_rows = mx.concatenate([condition_rows, video_rows])
@@ -327,6 +415,7 @@ class MiniMaxH3Pipeline:
                 block_cache_sigma=float(video_sched.sigmas[i].item()),
                 block_cache_step=i,
                 block_cache_total_steps=len(video_sched.timesteps),
+                block_provider=self._block_provider,
             )
             # Rebind rather than assign into a slice: the stepped result is a lazy graph reading the
             # very rows it would overwrite, and with conditioning rows present the two halves must
@@ -355,13 +444,31 @@ class MiniMaxH3Pipeline:
                       f"{step_times[-1]:.1f}s  eta {eta / 60:.1f} min", flush=True)
 
         # 7. Decode both modalities.
-        video = self._decode_video(video_rows[n_cond_v:], num_latent_frames, latent_height, latent_width)
-        audio = self._decode_audio(audio_rows[n_cond_a:], num_audio_latents)
+        if self._low_memory:
+            video_rows = mx.array(np.array(video_rows[n_cond_v:]), dtype=mx.float32)
+            audio_rows = mx.array(np.array(audio_rows[n_cond_a:]), dtype=mx.float32)
+            self._cache = None
+            self._cache_timesteps = None
+            self._block_provider = None
+            self._release_component("dit")
+
+            from .load import load_audio_vae, load_video_vae
+
+            self.video_vae = load_video_vae(self._checkpoint_root / "video_vae")
+            video = self._decode_video(video_rows, num_latent_frames, latent_height, latent_width)
+            self._release_component("video_vae")
+
+            self.audio_vae = load_audio_vae(self._checkpoint_root / "audio_vae")
+            audio = self._decode_audio(audio_rows, num_audio_latents)
+            self._release_component("audio_vae")
+        else:
+            video = self._decode_video(video_rows[n_cond_v:], num_latent_frames, latent_height, latent_width)
+            audio = self._decode_audio(audio_rows[n_cond_a:], num_audio_latents)
         total = time.perf_counter() - run_started
         return GenerationResult(
             video=video,
             audio=audio,
-            sample_rate=self.audio_vae.config.sampling_rate,
+            sample_rate=self._audio_config.sampling_rate,
             seconds_per_step=sum(step_times) / max(len(step_times), 1),
             total_seconds=total,
             block_cache_stats=block_cache.stats() if block_cache is not None else None,
@@ -370,9 +477,9 @@ class MiniMaxH3Pipeline:
     # -- decoding -----------------------------------------------------------------------------
 
     def _decode_video(self, rows, num_latent_frames, latent_height, latent_width) -> np.ndarray:
-        cfg = self.video_vae.config
+        cfg = self._video_config
         latents = unpatchify_video_tokens(
-            rows, num_latent_frames, latent_height, latent_width, cfg.latent_channels, self.dit.config.patch_size
+            rows, num_latent_frames, latent_height, latent_width, cfg.latent_channels, self._dit_config.patch_size
         )
         mean = mx.array(np.array(cfg.latents_mean, np.float32)).reshape(1, -1, 1, 1, 1)
         std = mx.array(np.array(cfg.latents_std, np.float32)).reshape(1, -1, 1, 1, 1)
@@ -387,7 +494,7 @@ class MiniMaxH3Pipeline:
         return (frames * 255.0 + 0.5).astype(np.uint8)
 
     def _decode_audio(self, rows, num_audio_latents) -> np.ndarray:
-        cfg = self.audio_vae.config
+        cfg = self._audio_config
         latents = unpack_audio_tokens(rows, num_audio_latents)
         mean = mx.array(np.array(cfg.latents_mean, np.float32)).reshape(1, -1, 1)
         std = mx.array(np.array(cfg.latents_std, np.float32)).reshape(1, -1, 1)

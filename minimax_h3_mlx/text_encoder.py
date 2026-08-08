@@ -81,6 +81,28 @@ class MiniMaxH3TextEncoder:
 
         self.language = Qwen3VLModel(self.text_config)
         self.vision = VisionModel(self.vision_config) if load_vision else None
+        quant_path = model_dir / "quant_config.json"
+        if quant_path.exists():
+            import mlx.nn as nn
+
+            with quant_path.open() as handle:
+                quant = json.load(handle)
+
+            def quantize_language(path, module):
+                weight = getattr(module, "weight", None)
+                return (
+                    hasattr(module, "to_quantized")
+                    and isinstance(weight, mx.array)
+                    and weight.ndim == 2
+                    and weight.shape[-1] % int(quant["group_size"]) == 0
+                )
+
+            nn.quantize(
+                self.language,
+                group_size=int(quant["group_size"]),
+                bits=int(quant["bits"]),
+                class_predicate=quantize_language,
+            )
         self._load_weights(model_dir, dtype, verbose)
 
         self.image_token_id = raw["image_token_id"]
