@@ -5,3 +5,18 @@ __pycache__/
 *.safetensors
 *.log
 out/
+.pytest_cache/
+build/
+dist/
+*.egg-info/
+.autors/
+CHECKPOINT.md
+research/*.lock
+docs/*.json
+*.md
+!README.md
+
+# Raw experiment reports can contain host paths and process metadata in addition
+# to being very large. Keep them local with the profiler captures and media.
+experiments/**
+!experiments/**/

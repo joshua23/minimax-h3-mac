@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Compatibility wrapper for the package-native MiniMax-H3 generation CLI."""
+"""CLI entry point for the MiniMax-H3 release asset manager."""
 
 from __future__ import annotations
 
@@ -9,8 +9,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-from minimax_h3_mlx.generate_cli import *  # re-export parser helpers used by lightweight tests
-from minimax_h3_mlx.generate_cli import main
+from minimax_h3_mlx.asset_manager import main
 
 
 if __name__ == "__main__":

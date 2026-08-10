@@ -1,0 +1,28 @@
+{
+  "checklist_stage_order": [
+    "deployability_baseline",
+    "hotpath_profile",
+    "mlx_metal_candidate",
+    "benchmark_validation",
+    "retain_or_revert"
+  ],
+  "completion_gate": "none",
+  "created_at": "2026-08-09T20:33:49.807874+00:00",
+  "created_by": "manager",
+  "last_failure": "Engineer interrupted because the Manager decided, on the operator's behalf, to abort this mission; error=External interrupt: operator abort requested: Existing deployment summary and independent media validation already pass; stop duplicate evidence audit.",
+  "name": "apple_mlx_inference",
+  "promoted": false,
+  "purpose": "Apple Silicon MLX/Metal deployment and inference optimization",
+  "require_independent_review": false,
+  "review_reason": "Bounded objective satisfied: a minimal opt-in refined text-conditioning cache was implemented without changing defaults; focused deterministic DiT tests prove cached vs uncached exact equality; touched-file compile and focused smoke/parity/CLI tests pass; the real 4-bit 320x192 warm interleaved artifact records preflight memory/swap, command/config, strict parity, timing, memory, and a retain-disabled/no-promotion decision because the candidate was slightly slower and used slightly more peak memory in the measured run.",
+  "role_banner": "",
+  "stages": [
+    "deployability_baseline",
+    "hotpath_profile",
+    "mlx_metal_candidate",
+    "benchmark_validation",
+    "retain_or_revert"
+  ],
+  "status": "formal",
+  "verified_at": "2026-08-09T21:02:07.174447+00:00"
+}

@@ -1,4 +1,38 @@
-# minimax-h3-mlx
+# MiniMax-H3 on Mac — Argus MLX Localization
+
+> 本仓库由 **Argus-AiTeam** 基于 `pipenetwork/minimax-h3-mlx` 进行本地化改造，专门面向
+> **Mac M4 Pro（24 GB 统一内存）** 部署 MiniMax-H3。Argus 将持续维护本仓库，并在严格
+> 质量验证的前提下继续推进推理加速与显存优化。
+
+This is the **Argus-AiTeam maintained Mac localization** of
+[`pipenetwork/minimax-h3-mlx`](https://github.com/PipeNetwork/minimax-h3-mlx), focused on making
+MiniMax-H3 deployable on an Apple Silicon **M4 Pro with 24 GB of unified memory**. Argus will
+continue maintaining this repository and developing verified acceleration paths for local
+generation.
+
+## Argus M4 Pro 24 GB work
+
+The Argus changes preserve the original model math by default while adding a deployment-oriented
+path for memory-constrained Macs:
+
+* staged text encoder, streamed DiT, video VAE, and audio VAE lifetimes;
+* a truncated 4-bit Qwen3-VL text encoder and one-block-at-a-time 4-bit DiT loading;
+* streamed AdaLN precomputation and optional H3-Turbo LoRA application without merging a second
+  checkpoint;
+* release-safe asset checks, environment diagnostics, local `ffmpeg` discovery, media validation,
+  forward profiling, and reproducible quality/performance gates;
+* default-off MLX/Metal optimization candidates that are promoted only after numerical, quality,
+  memory, and wall-clock validation.
+
+The current bounded deployment smoke test completes a muxed video/audio generation at 64×64 on the
+target machine while staying within the low-memory execution path. This is a wiring and
+deployability baseline, not a claim that production resolution is already fast: dense attention
+remains the dominant bottleneck, and 960×544 or higher runs still require strict memory-pressure
+preflight. The checked-in defaults therefore remain conservative, and experimental acceleration
+paths stay disabled until they pass the repository's numerical, media-quality, memory, and
+wall-clock gates.
+
+## Upstream foundation
 
 MLX (Apple Silicon) port of [**MiniMaxAI/MiniMax-H3**](https://huggingface.co/MiniMaxAI/MiniMax-H3) —
 MiniMax's omni-modal generative system for synchronized **video + audio** generation.
@@ -348,7 +382,7 @@ minimax_h3_mlx/
   text_encoder.py Qwen3-VL-32B conditioner, truncated to the 50 layers H3 reads
   pipeline.py    packing, the joint denoise loop, decoding
   media.py       mp4 / wav writing, dependency-free
-reference/       upstream sources, vendored for validation only (see reference/README.md)
+reference/       upstream sources, vendored for validation only
 
 scripts/
   generate.py           the CLI: prompt (+ keyframes) -> mp4
@@ -366,7 +400,9 @@ tests/           parity vs the reference, quant round-trip, smoke
 
 ## License
 
-The port is Apache-2.0. The **weights** are governed by the
+The original MLX port and the Argus localization are distributed under Apache-2.0. The
+`pipenetwork/minimax-h3-mlx` project remains the upstream implementation credited for the initial
+MLX port. The **weights** are governed by the
 [MiniMax H3 Community License](https://huggingface.co/MiniMaxAI/MiniMax-H3/blob/main/LICENSE),
 which is not an open-source licence: redistribution must carry a copy of the agreement, mark
 modified files, and display "Powered by MiniMax H3"; commercial use above $20M yearly revenue needs

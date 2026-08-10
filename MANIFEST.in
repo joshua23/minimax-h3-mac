@@ -1,0 +1,16 @@
+include LICENSE
+include README.md
+include requirements.txt
+include uv.lock
+include minimax_h3_mlx/release_assets.json
+include scripts/doctor.py
+include scripts/generate.py
+include scripts/preflight_assets.py
+include scripts/assets.py
+include scripts/run_release_cleanroom_smoke.py
+prune tests
+include tests/test_doctor.py
+include tests/test_generate_cli.py
+include tests/test_asset_preflight.py
+include tests/test_asset_manager.py
+include tests/test_media_tools.py

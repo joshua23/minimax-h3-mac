@@ -1,0 +1,80 @@
+{
+  "checked_surfaces": [
+    "target_repository",
+    "official_toolchains",
+    "research_frontier",
+    "adjacent_implementations"
+  ],
+  "decision_impact": "Online scope refresh found no material change to the local kernel boundary: default dense MLX remains the deployment baseline, dense-dequant profiles stay default-off after the 64x64 rejection, MacSol v1-v5 remain provenance-only until a design materially changes the exact-block cost model, and downstream work should be gated by strict parity plus pageout/swapout cleanliness. The repaired stage decision is a split gate: the scope bundle is complete, while final scope-stage closure still depends on Manager/Planner-owned research/PIPELINE_STATE.json creation, restoration, or advancement.",
+  "frontier_as_of": "2026-08-10",
+  "material_updates": [],
+  "network_status": "online",
+  "no_material_update": true,
+  "queries": [
+    {
+      "channel": "GitHub REST API and repository metadata",
+      "purpose": "Confirm the target repository surface and avoid assuming stale local-only setup defaults.",
+      "query": "PipeNetwork/minimax-h3-mlx official repository status and release-facing setup"
+    },
+    {
+      "channel": "Official MLX documentation and Apple developer documentation via HTTPS",
+      "purpose": "Refresh public Apple/MLX implementation constraints for strict-parity kernel scope.",
+      "query": "MLX 0.32 custom Metal kernels, quantized_matmul, and Apple Metal resource guidance"
+    },
+    {
+      "channel": "arXiv API plus NVlabs/Sana GitHub branch reference",
+      "purpose": "Recheck whether a newer official sparse-attention frontier changes the local MacSol scope decision.",
+      "query": "Sol-Attn Sol-Engine MiniMax-H3 sparse attention current public frontier"
+    }
+  ],
+  "record_id": "919643a95ca354df",
+  "recorded_at": "2026-08-10T15:04:54.906375+00:00",
+  "schema_version": 1,
+  "searched_at": "2026-08-10T15:00:27.855246+00:00",
+  "sources": [
+    {
+      "relevance": "Target repository surface; online probe returned HTTP 200, default branch main, pushed_at 2026-08-03T18:31:49Z.",
+      "source_type": "official_repo",
+      "title": "PipeNetwork/minimax-h3-mlx GitHub repository metadata",
+      "url": "https://api.github.com/repos/PipeNetwork/minimax-h3-mlx"
+    },
+    {
+      "relevance": "Defines the public MLX custom Metal kernel surface and reinforces the scope boundary that custom kernels are possible but not a hidden Apple tensor-core API.",
+      "source_type": "official_docs",
+      "title": "Custom Metal Kernels \u2014 MLX 0.32.0 documentation",
+      "url": "https://ml-explore.github.io/mlx/build/html/dev/custom_metal_kernels.html"
+    },
+    {
+      "relevance": "Official quantized-matmul primitive for packed affine 4-bit/8-bit linear layers; supports keeping strict-parity H3 linear paths on MLX QMM unless a measured exception clears gates.",
+      "source_type": "official_docs",
+      "title": "mlx.core.quantized_matmul \u2014 MLX 0.32.0 documentation",
+      "url": "https://ml-explore.github.io/mlx/build/html/python/_autosummary/mlx.core.quantized_matmul.html"
+    },
+    {
+      "relevance": "Official Apple guidance backing the scope rule that extra materialization and memory pressure are first-class deployment risks on the local M4-class objective.",
+      "source_type": "official_docs",
+      "title": "Metal Best Practices Guide: Resource Options",
+      "url": "https://developer.apple.com/library/archive/documentation/3DDrawing/Conceptual/MTLBestPracticesGuide/ResourceOptions.html"
+    },
+    {
+      "relevance": "Research-frontier source for Sol-Attn semantics; online probe confirmed the arXiv entry title for the current scope refresh.",
+      "source_type": "preprint",
+      "title": "Sol-Attn: Accelerating Video Generation Inference via On-the-Fly Attention Sparsification",
+      "url": "https://export.arxiv.org/api/query?id_list=2607.24027"
+    },
+    {
+      "relevance": "Research-frontier source for Sol-Engine system context; online probe confirmed the arXiv entry title for the current scope refresh.",
+      "source_type": "preprint",
+      "title": "Sol Video Inference Engine: Agent-Native Full-Stack Acceleration Framework for Efficient Video Generation",
+      "url": "https://export.arxiv.org/api/query?id_list=2606.23743"
+    },
+    {
+      "relevance": "Adjacent official implementation reference; online probe returned branch head 01d4bfafc18b6e3c9955052e48890678ba6c0222, matching the prior pinned audit and yielding no new Apple-legal MacSol speed path.",
+      "source_type": "official_repo",
+      "title": "NVlabs/Sana sol-engine branch reference",
+      "url": "https://api.github.com/repos/NVlabs/Sana/git/ref/heads/sol-engine"
+    }
+  ],
+  "stage": "scope",
+  "trigger": "scope_stage_frontier_refresh"
+}

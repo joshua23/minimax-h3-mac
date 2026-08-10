@@ -1,0 +1,54 @@
+[build-system]
+requires = ["setuptools>=77", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "minimax-h3-mlx"
+version = "0.1.0"
+description = "Argus localization for deploying and accelerating MiniMax-H3 on a 24 GB Apple Silicon Mac."
+readme = "README.md"
+requires-python = ">=3.11"
+license = "Apache-2.0"
+license-files = ["LICENSE"]
+authors = [
+  { name = "Argus-AiTeam" },
+  { name = "MiniMax-H3 MLX contributors" }
+]
+keywords = ["mlx", "apple-silicon", "minimax-h3", "video-generation", "audio-generation"]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Environment :: MacOS X",
+  "Intended Audience :: Developers",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Topic :: Multimedia :: Video",
+  "Topic :: Scientific/Engineering :: Artificial Intelligence"
+]
+dependencies = [
+  "mlx>=0.32.0",
+  "mlx-vlm>=0.6.10",
+  "numpy>=1.26",
+  "pillow>=10",
+  "safetensors>=0.4",
+  "huggingface_hub>=0.30",
+  "transformers>=4.57"
+]
+
+[project.urls]
+Homepage = "https://github.com/Argus-AiTeam/minimax-h3-mac"
+Repository = "https://github.com/Argus-AiTeam/minimax-h3-mac"
+MLX-Upstream = "https://github.com/PipeNetwork/minimax-h3-mlx"
+Model-Upstream = "https://huggingface.co/MiniMaxAI/MiniMax-H3"
+
+[project.scripts]
+minimax-h3-generate = "minimax_h3_mlx.generate_cli:main"
+minimax-h3-doctor = "minimax_h3_mlx.doctor:main"
+minimax-h3-assets = "minimax_h3_mlx.asset_manager:main"
+minimax-h3-media-smoke = "minimax_h3_mlx.cleanroom_smoke:main"
+
+[tool.setuptools.packages.find]
+include = ["minimax_h3_mlx*"]
+
+[tool.setuptools.package-data]
+minimax_h3_mlx = ["release_assets.json"]

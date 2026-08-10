@@ -8,12 +8,13 @@ sequence.
 
 from __future__ import annotations
 
-import shutil
 import subprocess
 import wave
 from pathlib import Path
 
 import numpy as np
+
+from minimax_h3_mlx.media_tools import media_tool_error, resolve_media_tool
 
 
 def save_wav(path: str | Path, audio: np.ndarray, sample_rate: int) -> Path:
@@ -33,6 +34,14 @@ def save_wav(path: str | Path, audio: np.ndarray, sample_rate: int) -> Path:
     return path
 
 
+def _resolve_executable(name: str, explicit: str | Path | None = None, *, env_var: str | None = None) -> str:
+    """Resolve a media executable through the centralized release-safe resolver."""
+    resolution = resolve_media_tool(name, explicit, env_var=env_var, cwd=Path.cwd())
+    if not resolution.ok:
+        raise RuntimeError(media_tool_error(resolution))
+    return str(resolution.command)
+
+
 def save_mp4(
     path: str | Path,
     video: np.ndarray,
@@ -40,14 +49,14 @@ def save_mp4(
     audio: np.ndarray | None = None,
     sample_rate: int = 32000,
     crf: int = 18,
+    ffmpeg: str | Path | None = None,
 ) -> Path:
     """Encode ``(frames, height, width, 3)`` uint8 video, muxing audio when given.
 
-    Raises if ``ffmpeg`` is not on PATH; use :func:`save_frames` in that case.
+    Raises if ``ffmpeg`` is unavailable; use :func:`save_frames` only for non-deployment fallbacks.
+    An explicit ``ffmpeg`` path or ``MINIMAX_H3_FFMPEG`` env var is honored before PATH.
     """
-    ffmpeg = shutil.which("ffmpeg")
-    if ffmpeg is None:
-        raise RuntimeError("ffmpeg not found on PATH; use save_frames() instead.")
+    ffmpeg_path = _resolve_executable("ffmpeg", ffmpeg, env_var="MINIMAX_H3_FFMPEG")
 
     path = Path(path)
     video = np.ascontiguousarray(video, dtype=np.uint8)
@@ -59,7 +68,7 @@ def save_mp4(
         save_wav(audio_path, audio, sample_rate)
 
     cmd = [
-        ffmpeg, "-y", "-loglevel", "error",
+        ffmpeg_path, "-y", "-loglevel", "error",
         "-f", "rawvideo", "-pix_fmt", "rgb24",
         "-s", f"{width}x{height}", "-r", str(fps), "-i", "pipe:0",
     ]

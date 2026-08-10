@@ -25,6 +25,12 @@ import numpy as np
 from .adaln import ModulationCache, drop_adaln_weights
 from .block_cache import BlockCacheConfig, BlockResidualCache
 from .config import DiTConfig, PipelineConfig
+from .dit import (
+    DENSE_DEQUANT_PROFILE_OFF,
+    apply_dense_dequant_profile_to_block,
+    normalize_dense_dequant_profile,
+)
+from .forward_profile import profiled_call
 from .packing import (
     AUDIO_CHANNELS,
     FPS,
@@ -42,6 +48,40 @@ from .packing import (
     video_latent_num_frames,
 )
 from .scheduler import MiniMaxH3Scheduler
+
+
+def _call_mlx_memory_control(name: str, *args) -> bool:
+    """Call an optional MLX allocator/memory-control hook if this MLX build exposes it."""
+
+    for owner in (mx, getattr(mx, "metal", None)):
+        if owner is None:
+            continue
+        func = getattr(owner, name, None)
+        if func is None:
+            continue
+        try:
+            func(*args)
+            return True
+        except Exception:
+            continue
+    return False
+
+
+def _drain_mlx_cache() -> None:
+    """Synchronize, collect Python references, and return cached Metal buffers to MLX/Metal."""
+
+    gc.collect()
+    mx.synchronize()
+    _call_mlx_memory_control("clear_cache")
+
+
+def _apply_mlx_pressure_limits(memory_limit_gb: float) -> None:
+    """Apply conservative MLX allocator limits without changing model math."""
+
+    limit_bytes = int(float(memory_limit_gb) * 1e9)
+    _call_mlx_memory_control("set_cache_limit", 0)
+    _call_mlx_memory_control("set_memory_limit", limit_bytes)
+    _call_mlx_memory_control("set_wired_limit", limit_bytes)
 
 
 @dataclass
@@ -86,9 +126,20 @@ class MiniMaxH3Pipeline:
         self._checkpoint_root: Path | None = None
         self._dit_path: Path | None = None
         self._text_encoder_path: Path | None = None
+        self._turbo_lora_path: Path | None = None
+        self._turbo_lora_alpha = 8.0
+        self._turbo_lora_scale = 1.0
+        self._block_load_mode = "mlx"
+        self._stream_block_group_size = 1
+        self._dense_dequant_profile = DENSE_DEQUANT_PROFILE_OFF
+        self._dense_dequant_attention_qkv_tile_size = 2048
+        self._dense_dequant_ffn_fc2_tile_size = 1024
+        self._dense_dequant_attention_out_tile_size = 2048
         self._dit_config = getattr(dit, "config", None)
         self._video_config = getattr(video_vae, "config", None)
         self._audio_config = getattr(audio_vae, "config", None)
+        self._memory_pressure_guard = False
+        self._memory_limit_gb = 16.0
 
     @classmethod
     def from_pretrained(
@@ -100,7 +151,17 @@ class MiniMaxH3Pipeline:
         stream_blocks: bool = False,
         low_memory: bool = False,
         text_encoder_dir: str | Path | None = None,
+        turbo_lora_path: str | Path | None = None,
+        turbo_lora_alpha: float = 8.0,
+        turbo_lora_scale: float = 1.0,
         memory_limit_gb: float = 16.0,
+        block_load_mode: str = "mlx",
+        stream_block_group_size: int = 1,
+        dense_dequant_profile: str | None = None,
+        dense_dequant_attention_qkv_tile_size: int = 2048,
+        dense_dequant_ffn_fc2_tile_size: int = 1024,
+        dense_dequant_attention_out_tile_size: int = 2048,
+        memory_pressure_guard: bool = False,
         verbose: bool = True,
     ) -> "MiniMaxH3Pipeline":
         """Load a released ``FL2VA/`` (or ``Ref2VA/``) directory.
@@ -119,16 +180,28 @@ class MiniMaxH3Pipeline:
             read_audio_vae_config,
             read_video_vae_config,
         )
-        from .streaming import load_streaming_dit
+        from .streaming import BLOCK_LOAD_MODES, load_streaming_dit
         from .text_encoder import MiniMaxH3TextEncoder
 
         root = Path(checkpoint_dir)
         dit_path = Path(transformer_dir) if transformer_dir else root / "transformer"
+        if block_load_mode not in BLOCK_LOAD_MODES:
+            allowed = ", ".join(BLOCK_LOAD_MODES)
+            raise ValueError(f"unknown block load mode {block_load_mode!r}; expected one of: {allowed}")
+        stream_block_group_size = int(stream_block_group_size)
+        if stream_block_group_size <= 0:
+            raise ValueError(f"stream_block_group_size must be positive, got {stream_block_group_size}")
         config = PipelineConfig.from_model_index(root / "model_index.json")
+
+        if memory_pressure_guard:
+            _apply_mlx_pressure_limits(memory_limit_gb)
+            _drain_mlx_cache()
 
         if low_memory:
             mx.set_cache_limit(0)
             mx.set_memory_limit(int(memory_limit_gb * 1e9))
+            if memory_pressure_guard:
+                _apply_mlx_pressure_limits(memory_limit_gb)
             text_path = Path(text_encoder_dir) if text_encoder_dir else root / "text_encoder-mlx-4bit"
             if not (text_path / "quant_config.json").is_file():
                 raise FileNotFoundError(
@@ -139,10 +212,23 @@ class MiniMaxH3Pipeline:
                     f"low-memory mode requires a quantized transformer at {dit_path}"
                 )
             pipeline = cls(None, None, None, None, config)
+            pipeline._memory_pressure_guard = bool(memory_pressure_guard)
+            pipeline._memory_limit_gb = float(memory_limit_gb)
             pipeline._low_memory = True
             pipeline._checkpoint_root = root
             pipeline._dit_path = dit_path
             pipeline._text_encoder_path = text_path
+            pipeline._turbo_lora_path = Path(turbo_lora_path) if turbo_lora_path else None
+            pipeline._turbo_lora_alpha = turbo_lora_alpha
+            pipeline._turbo_lora_scale = turbo_lora_scale
+            pipeline._block_load_mode = block_load_mode
+            pipeline._stream_block_group_size = stream_block_group_size
+            pipeline.set_dense_dequant_profile(
+                dense_dequant_profile,
+                attention_qkv_tile_size=dense_dequant_attention_qkv_tile_size,
+                ffn_fc2_tile_size=dense_dequant_ffn_fc2_tile_size,
+                attention_out_tile_size=dense_dequant_attention_out_tile_size,
+            )
             pipeline._dit_config = DiTConfig.from_json(dit_path / "config.json")
             pipeline._video_config = read_video_vae_config(root / "video_vae")
             pipeline._audio_config = read_audio_vae_config(root / "audio_vae")
@@ -150,20 +236,29 @@ class MiniMaxH3Pipeline:
 
         def step(label, fn):
             started = time.perf_counter()
-            out = fn()
+            out = profiled_call(f"load.{label}", "load_overhead", fn, eval_output=False)
             if verbose:
                 print(f"  {label}: {time.perf_counter() - started:.1f}s")
             return out
 
         if verbose:
             print(f"loading MiniMax-H3 from {root}")
+        text_path = Path(text_encoder_dir) if text_encoder_dir else root / "text_encoder"
         text_encoder = step(
-            "text encoder", lambda: MiniMaxH3TextEncoder(root / "text_encoder", dtype=dtype, load_vision=load_vision)
+            "text encoder", lambda: MiniMaxH3TextEncoder(text_path, dtype=dtype, load_vision=load_vision)
         )
-        if stream_blocks:
+        if stream_blocks or turbo_lora_path is not None:
             dit, block_provider = step(
                 f"streaming transformer ({dit_path.name})",
-                lambda: load_streaming_dit(dit_path, verbose=verbose),
+                lambda: load_streaming_dit(
+                    dit_path,
+                    turbo_lora_path=turbo_lora_path,
+                    turbo_lora_alpha=turbo_lora_alpha,
+                    turbo_lora_scale=turbo_lora_scale,
+                    block_load_mode=block_load_mode,
+                    stream_block_group_size=stream_block_group_size,
+                    verbose=verbose,
+                ),
             )
         else:
             dit = step(f"transformer ({dit_path.name})", lambda: load_dit(dit_path))
@@ -171,15 +266,62 @@ class MiniMaxH3Pipeline:
         video_vae = step("video vae", lambda: load_video_vae(root / "video_vae"))
         audio_vae = step("audio vae", lambda: load_audio_vae(root / "audio_vae"))
         pipeline = cls(dit, text_encoder, video_vae, audio_vae, config)
+        pipeline._memory_pressure_guard = bool(memory_pressure_guard)
+        pipeline._memory_limit_gb = float(memory_limit_gb)
         pipeline._block_provider = block_provider
+        pipeline._stream_block_group_size = stream_block_group_size
+        pipeline.set_dense_dequant_profile(
+            dense_dequant_profile,
+            attention_qkv_tile_size=dense_dequant_attention_qkv_tile_size,
+            ffn_fc2_tile_size=dense_dequant_ffn_fc2_tile_size,
+            attention_out_tile_size=dense_dequant_attention_out_tile_size,
+        )
         return pipeline
+
+    def set_dense_dequant_profile(
+        self,
+        profile: str | None,
+        *,
+        attention_qkv_tile_size: int = 2048,
+        ffn_fc2_tile_size: int = 1024,
+        attention_out_tile_size: int = 2048,
+    ) -> None:
+        """Configure an opt-in/provenance dense-dequant profile for main DiT blocks."""
+
+        selected = normalize_dense_dequant_profile(profile)
+        self._dense_dequant_profile = selected
+        self._dense_dequant_attention_qkv_tile_size = int(attention_qkv_tile_size)
+        self._dense_dequant_ffn_fc2_tile_size = int(ffn_fc2_tile_size)
+        self._dense_dequant_attention_out_tile_size = int(attention_out_tile_size)
+        if self._block_provider is not None:
+            set_profile = getattr(self._block_provider, "set_dense_dequant_profile", None)
+            if set_profile is not None:
+                set_profile(
+                    selected,
+                    attention_qkv_tile_size=self._dense_dequant_attention_qkv_tile_size,
+                    ffn_fc2_tile_size=self._dense_dequant_ffn_fc2_tile_size,
+                    attention_out_tile_size=self._dense_dequant_attention_out_tile_size,
+                )
+        if self.dit is not None and getattr(self.dit, "blocks", None):
+            for block in self.dit.blocks:
+                apply_dense_dequant_profile_to_block(
+                    block,
+                    selected,
+                    attention_qkv_tile_size=self._dense_dequant_attention_qkv_tile_size,
+                    ffn_fc2_tile_size=self._dense_dequant_ffn_fc2_tile_size,
+                    attention_out_tile_size=self._dense_dequant_attention_out_tile_size,
+                )
+
+    def _memory_guard_boundary(self) -> None:
+        """Reassert optional allocator limits and drain reusable MLX/Metal buffers."""
+        if self._memory_pressure_guard:
+            _apply_mlx_pressure_limits(self._memory_limit_gb)
+        _drain_mlx_cache()
 
     def _release_component(self, name: str) -> None:
         """Drop one phase-owned component and return cached Metal buffers."""
         setattr(self, name, None)
-        gc.collect()
-        mx.synchronize()
-        mx.clear_cache()
+        self._memory_guard_boundary()
 
     # -- schedule -----------------------------------------------------------------------------
 
@@ -297,6 +439,7 @@ class MiniMaxH3Pipeline:
         width: int | None = None,
         drop_adaln: bool = True,
         block_cache_config: BlockCacheConfig | None = None,
+        cache_text_conditioning: bool = False,
         verbose: bool = True,
     ) -> GenerationResult:
         """Generate a clip.
@@ -308,6 +451,8 @@ class MiniMaxH3Pipeline:
             height, width: override the canvas ``aspect`` would resolve to. Both must be multiples
                 of 32. H3 was released for a 768-pixel short edge only, so anything else is
                 off-distribution — useful for exercising the pipeline, not for quality.
+            cache_text_conditioning: disabled-by-default candidate that precomputes the refined
+                text stream once and reuses it for every denoising DiT call.
         """
         run_started = time.perf_counter()
 
@@ -316,14 +461,24 @@ class MiniMaxH3Pipeline:
         if self._low_memory:
             from .text_encoder import MiniMaxH3TextEncoder
 
-            self.text_encoder = MiniMaxH3TextEncoder(
-                self._text_encoder_path,
-                load_vision=False,
-                verbose=verbose,
+            self.text_encoder = profiled_call(
+                "load.text_encoder_low_memory",
+                "load_overhead",
+                lambda: MiniMaxH3TextEncoder(
+                    self._text_encoder_path,
+                    load_vision=False,
+                    verbose=verbose,
+                ),
+                eval_output=False,
             )
 
         # 1. Text conditioning. Keyframe vision blocks come back tagged as *video* rows.
-        prompt_embeds, text_token_tags = self.text_encoder.encode(prompt, images)
+        prompt_embeds, text_token_tags = profiled_call(
+            "pipeline.text_encoder_encode",
+            "text_conditioning",
+            lambda: self.text_encoder.encode(prompt, images),
+            metadata={"has_images": bool(images)},
+        )
         if self._low_memory:
             prompt_embeds = detach_bfloat16(prompt_embeds)
             text_token_tags = np.array(text_token_tags, copy=True)
@@ -331,10 +486,28 @@ class MiniMaxH3Pipeline:
 
             from .streaming import load_streaming_dit
 
-            self.dit, self._block_provider = load_streaming_dit(
-                self._dit_path,
-                verbose=verbose,
+            self.dit, self._block_provider = profiled_call(
+                "load.streaming_transformer_low_memory",
+                "load_overhead",
+                lambda: load_streaming_dit(
+                    self._dit_path,
+                    turbo_lora_path=self._turbo_lora_path,
+                    turbo_lora_alpha=self._turbo_lora_alpha,
+                    turbo_lora_scale=self._turbo_lora_scale,
+                    block_load_mode=self._block_load_mode,
+                    stream_block_group_size=self._stream_block_group_size,
+                    verbose=verbose,
+                ),
+                eval_output=False,
             )
+            self.set_dense_dequant_profile(
+                self._dense_dequant_profile,
+                attention_qkv_tile_size=self._dense_dequant_attention_qkv_tile_size,
+                ffn_fc2_tile_size=self._dense_dequant_ffn_fc2_tile_size,
+                attention_out_tile_size=self._dense_dequant_attention_out_tile_size,
+            )
+            if self._memory_pressure_guard:
+                self._memory_guard_boundary()
 
         # 2. Geometry.
         if height is None or width is None:
@@ -366,7 +539,11 @@ class MiniMaxH3Pipeline:
         # 3. Keyframe conditioning rows, encoded before any request noise is drawn.
         condition_rows = None
         if images:
-            condition_rows = self._encode_keyframes(images, height, width)
+            condition_rows = profiled_call(
+                "pipeline.encode_keyframes",
+                "conditioning_encode",
+                lambda: self._encode_keyframes(images, height, width),
+            )
 
         # 4. Initial noise. Draw order matches the reference — the conditioning noise comes off the
         #    request generator first, then video, then audio — so a seed reproduces the same run.
@@ -391,11 +568,38 @@ class MiniMaxH3Pipeline:
         # 5. Two schedules over one shared forward.
         video_sched, audio_sched = self._build_schedules(num_inference_steps)
         timestep_table, plan = self._row_timestep_plan(layout, video_sched.timesteps, audio_sched.timesteps)
-        self._ensure_cache(timestep_table, drop_adaln, verbose)
+        profiled_call(
+            "pipeline.adaln_cache_build",
+            "load_overhead",
+            lambda: self._ensure_cache(timestep_table, drop_adaln, verbose),
+            eval_output=False,
+            metadata={"timestep_count": timestep_table.shape[0], "drop_adaln": drop_adaln},
+        )
+        if self._memory_pressure_guard:
+            self._memory_guard_boundary()
 
         n_cond_v = layout.num_condition_video_rows
         n_cond_a = layout.num_condition_audio_rows
         embeds = prompt_embeds.astype(mx.bfloat16)
+        refined_text = None
+        embeds_for_dit = embeds
+        if cache_text_conditioning:
+            started = time.perf_counter()
+            refined_text = self.dit.precompute_text_conditioning(
+                embeds,
+                block_provider=self._block_provider,
+            )
+            mx.eval(refined_text)
+            # The opt-in cached path no longer needs prompt embeddings during denoising.
+            embeds_for_dit = None
+            embeds = None
+            prompt_embeds = None
+            self._memory_guard_boundary()
+            if verbose:
+                print(
+                    f"  text conditioning cache: {refined_text.nbytes / 1e6:.1f} MB "
+                    f"in {time.perf_counter() - started:.1f}s"
+                )
         block_cache = (
             BlockResidualCache(block_cache_config)
             if block_cache_config is not None
@@ -407,23 +611,29 @@ class MiniMaxH3Pipeline:
         step_times = []
         for i, t in enumerate(video_sched.timesteps.tolist()):
             started = time.perf_counter()
-            video_pred, audio_pred = self.dit(
-                video_rows[None].astype(mx.bfloat16),
-                audio_rows[None].astype(mx.bfloat16),
-                embeds,
-                timestep_table,
-                plan[i],
-                layout.token_tags,
-                layout.position_ids,
-                layout.video_indices,
-                layout.audio_indices,
-                layout.text_indices,
-                modulation_cache=self._cache,
-                block_cache=block_cache,
-                block_cache_sigma=float(video_sched.sigmas[i].item()),
-                block_cache_step=i,
-                block_cache_total_steps=len(video_sched.timesteps),
-                block_provider=self._block_provider,
+            video_pred, audio_pred = profiled_call(
+                "pipeline.dit_forward_step",
+                "dit_forward_total",
+                lambda i=i: self.dit(
+                    video_rows[None].astype(mx.bfloat16),
+                    audio_rows[None].astype(mx.bfloat16),
+                    embeds_for_dit,
+                    timestep_table,
+                    plan[i],
+                    layout.token_tags,
+                    layout.position_ids,
+                    layout.video_indices,
+                    layout.audio_indices,
+                    layout.text_indices,
+                    modulation_cache=self._cache,
+                    block_cache=block_cache,
+                    block_cache_sigma=float(video_sched.sigmas[i].item()),
+                    block_cache_step=i,
+                    block_cache_total_steps=len(video_sched.timesteps),
+                    block_provider=self._block_provider,
+                    refined_text=refined_text,
+                ),
+                metadata={"step_index": i, "sigma": float(video_sched.sigmas[i].item())},
             )
             # Rebind rather than assign into a slice: the stepped result is a lazy graph reading the
             # very rows it would overwrite, and with conditioning rows present the two halves must
@@ -443,6 +653,12 @@ class MiniMaxH3Pipeline:
                 mx.concatenate([audio_rows[:n_cond_a], stepped_audio]) if n_cond_a else stepped_audio
             )
             mx.eval(video_rows, audio_rows)
+            if self._memory_pressure_guard:
+                video_pred = None
+                audio_pred = None
+                stepped_video = None
+                stepped_audio = None
+                self._memory_guard_boundary()
             step_times.append(time.perf_counter() - started)
             if verbose:
                 done = i + 1
@@ -462,16 +678,46 @@ class MiniMaxH3Pipeline:
 
             from .load import load_audio_vae, load_video_vae
 
-            self.video_vae = load_video_vae(self._checkpoint_root / "video_vae")
-            video = self._decode_video(video_rows, num_latent_frames, latent_height, latent_width)
+            self.video_vae = profiled_call(
+                "load.video_vae_low_memory",
+                "load_overhead",
+                lambda: load_video_vae(self._checkpoint_root / "video_vae"),
+                eval_output=False,
+            )
+            video = profiled_call(
+                "pipeline.video_vae_decode",
+                "vae_decode",
+                lambda: self._decode_video(video_rows, num_latent_frames, latent_height, latent_width),
+                eval_output=False,
+            )
             self._release_component("video_vae")
 
-            self.audio_vae = load_audio_vae(self._checkpoint_root / "audio_vae")
-            audio = self._decode_audio(audio_rows, num_audio_latents)
+            self.audio_vae = profiled_call(
+                "load.audio_vae_low_memory",
+                "load_overhead",
+                lambda: load_audio_vae(self._checkpoint_root / "audio_vae"),
+                eval_output=False,
+            )
+            audio = profiled_call(
+                "pipeline.audio_vae_decode",
+                "vae_decode",
+                lambda: self._decode_audio(audio_rows, num_audio_latents),
+                eval_output=False,
+            )
             self._release_component("audio_vae")
         else:
-            video = self._decode_video(video_rows[n_cond_v:], num_latent_frames, latent_height, latent_width)
-            audio = self._decode_audio(audio_rows[n_cond_a:], num_audio_latents)
+            video = profiled_call(
+                "pipeline.video_vae_decode",
+                "vae_decode",
+                lambda: self._decode_video(video_rows[n_cond_v:], num_latent_frames, latent_height, latent_width),
+                eval_output=False,
+            )
+            audio = profiled_call(
+                "pipeline.audio_vae_decode",
+                "vae_decode",
+                lambda: self._decode_audio(audio_rows[n_cond_a:], num_audio_latents),
+                eval_output=False,
+            )
         total = time.perf_counter() - run_started
         return GenerationResult(
             video=video,

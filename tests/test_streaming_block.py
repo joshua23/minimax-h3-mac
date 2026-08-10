@@ -113,25 +113,40 @@ def main() -> None:
         )
         try:
             streamed, provider = load_streaming_dit(root)
+            grouped, grouped_provider = load_streaming_dit(root, stream_block_group_size=2)
         finally:
             mx.quantize = original_quantize
         assert not any(key.startswith("blocks.") for key, _ in tree_flatten(streamed.parameters()))
+        assert not any(key.startswith("blocks.") for key, _ in tree_flatten(grouped.parameters()))
         cache = ModulationCache.build_streaming(streamed, provider, args[3], dtype=mx.float32)
         got_v, got_a = streamed(
             *args,
             modulation_cache=cache,
             block_provider=provider,
         )
-        mx.eval(got_v, got_a)
+        grouped_cache = ModulationCache.build_streaming(grouped, grouped_provider, args[3], dtype=mx.float32)
+        grouped_v, grouped_a = grouped(
+            *args,
+            modulation_cache=grouped_cache,
+            block_provider=grouped_provider,
+        )
+        mx.eval(got_v, got_a, grouped_v, grouped_a)
 
     video_delta = float(mx.max(mx.abs(want_v - got_v)).item())
     audio_delta = float(mx.max(mx.abs(want_a - got_a)).item())
+    grouped_video_delta = float(mx.max(mx.abs(want_v - grouped_v)).item())
+    grouped_audio_delta = float(mx.max(mx.abs(want_a - grouped_a)).item())
     assert video_delta == 0.0, video_delta
     assert audio_delta == 0.0, audio_delta
+    assert grouped_video_delta == 0.0, grouped_video_delta
+    assert grouped_audio_delta == 0.0, grouped_audio_delta
     assert provider.current_index == cfg.num_layers - 1
+    assert grouped_provider.current_index == cfg.num_layers - 1
+    assert grouped_provider.group_cache_hit_count > 0
     print(
         f"streaming block exact: video={video_delta} audio={audio_delta}; "
-        f"logical bytes loaded={provider.logical_bytes_loaded}"
+        f"group2 video={grouped_video_delta} audio={grouped_audio_delta}; "
+        f"logical bytes loaded={provider.logical_bytes_loaded}/{grouped_provider.logical_bytes_loaded}"
     )
 
 

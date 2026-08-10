@@ -98,6 +98,7 @@ def main() -> None:
         assert pipe._video_config.latent_channels == 24
         assert pipe._audio_config.latent_channels == 32
         assert pipe._dit_config.num_layers == 2
+        assert pipe._block_load_mode == "mlx"
         print("low-memory init holds metadata only")
 
 

@@ -178,6 +178,34 @@ def main() -> int:
     )
     mx.eval(got_v, got_a)
 
+    refined_text = dit.precompute_text_conditioning(mx.array(text))
+    cached_v, cached_a = dit(
+        mx.array(video),
+        mx.array(audio),
+        None,
+        mx.array(timestep),
+        mx.array(ts_i.astype(np.int32)),
+        mx.array(tags.astype(np.int32)),
+        mx.array(pos.astype(np.float32)),
+        mx.array(video_i.astype(np.int32)),
+        mx.array(audio_i.astype(np.int32)),
+        mx.array(text_i.astype(np.int32)),
+        refined_text=refined_text,
+    )
+    mx.eval(refined_text, cached_v, cached_a)
+    cache_dv = float(mx.max(mx.abs(got_v - cached_v)).item())
+    cache_da = float(mx.max(mx.abs(got_a - cached_a)).item())
+    cache_rel_v = 0.0 if cache_dv == 0.0 else cache_dv / float(mx.max(mx.abs(got_v)).item())
+    cache_rel_a = 0.0 if cache_da == 0.0 else cache_da / float(mx.max(mx.abs(got_a)).item())
+    print(
+        "cached text conditioning: "
+        f"video max_abs={cache_dv:.3e} max_rel={cache_rel_v:.3e}; "
+        f"audio max_abs={cache_da:.3e} max_rel={cache_rel_a:.3e}"
+    )
+    if cache_dv != 0.0 or cache_da != 0.0:
+        print("FAIL: cached text conditioning changed MLX DiT output")
+        return 1
+
     dv = float(np.abs(np.array(got_v) - ref_v.numpy()).max())
     da = float(np.abs(np.array(got_a) - ref_a.numpy()).max())
     scale_v = float(np.abs(ref_v.numpy()).max())

@@ -1,0 +1,13 @@
+{
+  "apple_mlx_inference": {
+    "purpose": "Apple Silicon MLX/Metal deployment and inference optimization",
+    "stages": [
+      "deployability_baseline",
+      "hotpath_profile",
+      "mlx_metal_candidate",
+      "benchmark_validation",
+      "retain_or_revert"
+    ],
+    "status": "formal"
+  }
+}
