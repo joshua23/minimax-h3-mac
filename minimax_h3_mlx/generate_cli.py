@@ -404,6 +404,16 @@ def parse_args(argv: Sequence[str] | None = None, *, env: Mapping[str, str] | No
 
 
 def main(argv: Sequence[str] | None = None) -> int:
+    # Pipes such as `2>&1 | tee generation.log` make Python block-buffer stdout by default, which
+    # can leave the log empty until the first explicitly flushed progress line. Keep CLI output
+    # line-buffered so model-loading and stage messages are visible immediately in live logs.
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure is not None:
+            try:
+                reconfigure(line_buffering=True)
+            except (OSError, ValueError):
+                pass
     args = parse_args(argv)
 
     from minimax_h3_mlx.block_cache import BlockCacheConfig
