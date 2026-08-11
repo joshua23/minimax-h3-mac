@@ -111,7 +111,9 @@ python scripts/generate.py "A fox running through a misty forest" \
 
 After the smoke test works, increase `--resolution`. Large production resolutions can be very slow because the open-source H3 release uses dense attention.
 
-## 5. Convert the original Larry Turbo LoRA yourself
+## 5. Validate and shard the original Larry Turbo LoRA for MLX streaming
+
+The original Larry safetensors already contains BF16 arrays that MLX can read, and its fused H3 tensor values are not numerically converted. This packaging step validates every key/shape/rank, records `alpha=rank`, and splits the monolithic 744 MB file into per-component shards so a 24 GB Mac loads only the current block. Runtimes with native support for Larry's raw key layout may use the original file directly; this repository's low-memory path expects the indexed directory produced below.
 
 Download `minimax_h3_turbo_v4_step600_ema.safetensors` from:
 
@@ -128,7 +130,7 @@ python scripts/convert_turbo_lora_to_mlx.py \
   --source-revision 43a74557ac3f6539db8e0f2a959d03feb7a81480
 ```
 
-The converter keeps all 518 tensors in BF16, validates all 259 LoRA pairs, records `alpha=rank`, and creates 53 component shards for streamed loading.
+The packager keeps all 518 tensors in BF16 and exactly unchanged, validates all 259 LoRA pairs, records `alpha=rank`, and creates 53 component shards for streamed loading.
 
 ## Model links
 
