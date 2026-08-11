@@ -1,4 +1,4 @@
-"""Low-memory, one-block-at-a-time loading for quantized MiniMax-H3 DiT."""
+"""Low-memory, one-block-at-a-time loading for quantized or BF16 MiniMax-H3 DiTs."""
 from __future__ import annotations
 
 import json
@@ -42,19 +42,20 @@ class _BlockSlot(nn.Module):
     def __init__(
         self,
         config: DiTConfig,
-        quantization: QuantConfig,
+        quantization: QuantConfig | None,
         source_block_index: int = 0,
     ) -> None:
         super().__init__()
         self.blocks = [TransformerBlock(config)]
-        apply_quantization_structure(
-            self,
-            quantization.for_block_slot(source_block_index),
-        )
+        if quantization is not None:
+            apply_quantization_structure(
+                self,
+                quantization.for_block_slot(source_block_index),
+            )
 
 
 class QuantizedBlockProvider:
-    """Load quantized transformer blocks lazily from indexed safetensors.
+    """Load quantized or full-precision transformer blocks lazily from indexed safetensors.
 
     By default the provider keeps the historical one reusable block slot.  The
     opt-in ``stream_block_group_size`` creates a small group of reusable slots and
@@ -76,16 +77,20 @@ class QuantizedBlockProvider:
         if self.stream_block_group_size <= 0:
             raise ValueError(f"stream_block_group_size must be positive, got {stream_block_group_size}")
         self.config = DiTConfig.from_json(self.model_dir / "config.json")
-        with (self.model_dir / "quant_config.json").open() as handle:
-            raw_quant = json.load(handle)
-        self.quantization = QuantConfig(
-            bits=int(raw_quant["bits"]),
-            group_size=int(raw_quant["group_size"]),
-            mode=str(raw_quant.get("mode", "affine")),
-            quantize_adaln=bool(raw_quant.get("quantize_adaln", False)),
-            adaln_bits=int(raw_quant.get("adaln_bits") or 8),
-            overrides={path: None for path in raw_quant.get("bf16_layers", [])},
-        )
+        quant_path = self.model_dir / "quant_config.json"
+        if quant_path.is_file():
+            with quant_path.open() as handle:
+                raw_quant = json.load(handle)
+            self.quantization: QuantConfig | None = QuantConfig(
+                bits=int(raw_quant["bits"]),
+                group_size=int(raw_quant["group_size"]),
+                mode=str(raw_quant.get("mode", "affine")),
+                quantize_adaln=bool(raw_quant.get("quantize_adaln", False)),
+                adaln_bits=int(raw_quant.get("adaln_bits") or 8),
+                overrides={path: None for path in raw_quant.get("bf16_layers", [])},
+            )
+        else:
+            self.quantization = None
         with (self.model_dir / "model.safetensors.index.json").open() as handle:
             self.weight_map = json.load(handle)["weight_map"]
         initial_indices = [
@@ -98,6 +103,8 @@ class QuantizedBlockProvider:
         ]
         self._slot_overrides = [
             self.quantization.for_block_slot(index).overrides
+            if self.quantization is not None
+            else None
             for index in initial_indices
         ]
         self.slot = self.slots[0]
@@ -171,7 +178,7 @@ class QuantizedBlockProvider:
                 hidden_size=self.config.hidden_size,
                 inner_dim=self.config.inner_dim,
                 ffn_hidden_size=self.config.ffn_hidden_size,
-                alpha=8.0 if alpha is None else alpha,
+                alpha=alpha,
                 scale=scale,
             )
             self.final_lora = None
@@ -182,6 +189,8 @@ class QuantizedBlockProvider:
         return self.config.num_layers
 
     def _ensure_slot_structure(self, slot_index: int, block_index: int) -> None:
+        if self.quantization is None:
+            return
         mapped = self.quantization.for_block_slot(block_index)
         if self._slot_overrides[slot_index] != mapped.overrides:
             self.slots[slot_index] = _BlockSlot(
@@ -274,6 +283,16 @@ class QuantizedBlockProvider:
         ]
         updates_by_slot: list[list[tuple[str, mx.array]]] = [[] for _ in range(group_end - group_start)]
         found_by_slot: list[set[str]] = [set() for _ in range(group_end - group_start)]
+        # The previous block has already been synchronized by the caller. Drop its arrays before
+        # opening the next multi-gigabyte BF16 shard so old and new blocks do not overlap.
+        for offset in range(group_end - group_start):
+            slot = self.slots[offset]
+            all_keys = {key for key, _ in tree_flatten(slot.parameters())}
+            slot.update(tree_unflatten([(key, mx.array(0, dtype=mx.uint32)) for key in all_keys]))
+        mx.synchronize()
+        clear_cache = getattr(mx, "clear_cache", None)
+        if clear_cache is not None:
+            clear_cache()
         key_routes: dict[str, tuple[int, str]] = {}
         by_shard: dict[str, list[str]] = {}
         for block_index in range(group_start, group_end):
@@ -338,15 +357,17 @@ def load_streaming_dit(
     )
     model = MiniMaxH3DiT(provider.config, build_blocks=False)
 
-    # Quantize token-refiner linears so the non-block checkpoint keys match.
-    predicate = _class_predicate(provider.quantization)
+    # Quantized checkpoints need matching packed slots. A source BF16 checkpoint keeps the normal
+    # dense MLX module structure and loads the serialized arrays without conversion.
+    if provider.quantization is not None:
+        predicate = _class_predicate(provider.quantization)
 
-    def static_predicate(path: str, module: nn.Module):
-        if path.startswith("blocks."):
-            return False
-        return predicate(path, module)
+        def static_predicate(path: str, module: nn.Module):
+            if path.startswith("blocks."):
+                return False
+            return predicate(path, module)
 
-    apply_quantized_slots(model, static_predicate)
+        apply_quantized_slots(model, static_predicate)
 
     expected = {
         key
@@ -379,8 +400,9 @@ def load_streaming_dit(
         )
     if verbose:
         size = sum(tensor.nbytes for _, tensor in updates) / 1e9
+        precision = "quantized" if provider.quantization is not None else "BF16/full-precision"
         print(
-            f"loaded {len(updates)} static tensors ({size:.2f} GB); "
+            f"loaded {len(updates)} static tensors ({size:.2f} GB, {precision}); "
             f"main blocks stream lazily in groups of {provider.stream_block_group_size}"
         )
     return model, provider

@@ -125,6 +125,9 @@ def write_release_layout(model: Qwen3VLTextModel, cfg: Qwen3VLTextConfig, path: 
     # seen to skip it.
     state["lm_head.weight"] = torch.zeros(cfg.vocab_size, HIDDEN)
     save_file(state, str(path / "model.safetensors"))
+    (path / "model.safetensors.index.json").write_text(json.dumps({
+        "weight_map": {key: "model.safetensors" for key in state},
+    }))
 
 
 def main() -> int:
@@ -156,9 +159,17 @@ def main() -> int:
               len(enc.language.layers) == READ_LAYER,
               f"{len(enc.language.layers)} layers, skipped {enc.skipped_tensors} tensors")
 
-        got = np.array(
-            enc._hidden_states(mx.array(input_ids.numpy().astype(np.int32)), mx.array(ramp.numpy()))
+        mlx_ids = mx.array(input_ids.numpy().astype(np.int32))
+        mlx_positions = mx.array(ramp.numpy())
+        got = np.array(enc._hidden_states(mlx_ids, mlx_positions))
+        streamed = MiniMaxH3TextEncoder(
+            path,
+            num_layers=READ_LAYER,
+            dtype=mx.float32,
+            load_vision=False,
+            stream_layers=True,
         )
+        got_streamed = np.array(streamed._hidden_states(mlx_ids, mlx_positions))
 
     ok = got.shape == want.shape
     check("hidden state shape", ok, f"{got.shape} vs {want.shape}")
@@ -166,6 +177,9 @@ def main() -> int:
         delta = float(np.abs(got - want).max())
         check(f"hidden_states[{READ_LAYER}] values", delta < 2e-4,
               f"max|delta| {delta:.3e} (scale {np.abs(want).max():.3e})")
+        streamed_delta = float(np.abs(got_streamed - got).max())
+        check("streamed full-precision layers match resident loading", streamed_delta < 2e-6,
+              f"max|delta| {streamed_delta:.3e}")
 
         # The point of reading pre-norm: it must NOT equal the normed final state.
         final_delta = float(np.abs(got - want_final).max())

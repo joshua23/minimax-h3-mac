@@ -18,15 +18,21 @@ from minimax_h3_mlx.pipeline import MiniMaxH3Pipeline, detach_bfloat16
 
 def write_metadata(root: Path) -> tuple[Path, Path]:
     (root / "model_index.json").write_text("{}")
-    text = root / "text-4bit"
+    text = root / "text_encoder"
     dit = root / "dit-4bit"
     text.mkdir()
     dit.mkdir()
-    (text / "quant_config.json").write_text('{"bits":4,"group_size":64}')
+    (text / "config.json").write_text("{}")
+    (text / "model.safetensors.index.json").write_text(
+        '{"weight_map":{"model.language_model.embed_tokens.weight":"model.safetensors"}}'
+    )
     cfg = asdict(DiTConfig(num_layers=2))
     cfg["patch_size"] = list(cfg["patch_size"])
     (dit / "config.json").write_text(json.dumps(cfg))
     (dit / "quant_config.json").write_text('{"bits":4,"group_size":64}')
+    (dit / "model.safetensors.index.json").write_text(
+        '{"weight_map":{"video_patch_proj.weight":"model.safetensors"}}'
+    )
 
     video = root / "video_vae"
     (video / "source").mkdir(parents=True)

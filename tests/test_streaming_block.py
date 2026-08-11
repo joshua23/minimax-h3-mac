@@ -1,4 +1,4 @@
-"""Eager and one-block-at-a-time quantized DiT must agree exactly."""
+"""Eager and one-block-at-a-time quantized/BF16 DiTs must agree exactly."""
 from __future__ import annotations
 
 import json
@@ -74,7 +74,13 @@ def inputs(cfg: DiTConfig):
     )
 
 
-def write_checkpoint(root: Path, model: MiniMaxH3DiT, cfg: DiTConfig) -> None:
+def write_checkpoint(
+    root: Path,
+    model: MiniMaxH3DiT,
+    cfg: DiTConfig,
+    *,
+    quantized: bool = True,
+) -> None:
     state = dict(tree_flatten(model.parameters()))
     shard = "model.safetensors"
     mx.save_safetensors(str(root / shard), state)
@@ -84,12 +90,13 @@ def write_checkpoint(root: Path, model: MiniMaxH3DiT, cfg: DiTConfig) -> None:
     raw_config = asdict(cfg)
     raw_config["patch_size"] = list(cfg.patch_size)
     (root / "config.json").write_text(json.dumps(raw_config))
-    (root / "quant_config.json").write_text(json.dumps({
-        "bits": 4,
-        "group_size": 64,
-        "quantize_adaln": True,
-        "adaln_bits": 8,
-    }))
+    if quantized:
+        (root / "quant_config.json").write_text(json.dumps({
+            "bits": 4,
+            "group_size": 64,
+            "quantize_adaln": True,
+            "adaln_bits": 8,
+        }))
 
 
 def main() -> None:
@@ -143,9 +150,40 @@ def main() -> None:
     assert provider.current_index == cfg.num_layers - 1
     assert grouped_provider.current_index == cfg.num_layers - 1
     assert grouped_provider.group_cache_hit_count > 0
+
+    # An upstream BF16/full-precision directory has no quant_config.json. It must use the same
+    # one-block residency path without inventing a quantization recipe.
+    mx.random.seed(1)
+    dense = MiniMaxH3DiT(cfg)
+    dense_args = inputs(cfg)
+    dense_want_v, dense_want_a = dense(*dense_args)
+    mx.eval(dense_want_v, dense_want_a)
+    with tempfile.TemporaryDirectory() as directory:
+        dense_root = Path(directory)
+        write_checkpoint(dense_root, dense, cfg, quantized=False)
+        dense_streamed, dense_provider = load_streaming_dit(dense_root)
+        assert dense_provider.quantization is None
+        dense_cache = ModulationCache.build_streaming(
+            dense_streamed,
+            dense_provider,
+            dense_args[3],
+            dtype=mx.float32,
+        )
+        dense_got_v, dense_got_a = dense_streamed(
+            *dense_args,
+            modulation_cache=dense_cache,
+            block_provider=dense_provider,
+        )
+        mx.eval(dense_got_v, dense_got_a)
+    dense_video_delta = float(mx.max(mx.abs(dense_want_v - dense_got_v)).item())
+    dense_audio_delta = float(mx.max(mx.abs(dense_want_a - dense_got_a)).item())
+    assert dense_video_delta == 0.0, dense_video_delta
+    assert dense_audio_delta == 0.0, dense_audio_delta
+
     print(
         f"streaming block exact: video={video_delta} audio={audio_delta}; "
         f"group2 video={grouped_video_delta} audio={grouped_audio_delta}; "
+        f"BF16 video={dense_video_delta} audio={dense_audio_delta}; "
         f"logical bytes loaded={provider.logical_bytes_loaded}/{grouped_provider.logical_bytes_loaded}"
     )
 

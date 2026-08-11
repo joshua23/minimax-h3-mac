@@ -7,7 +7,8 @@ diffusers port, so a config file can be loaded verbatim.
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass, field
+import math
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any
 
@@ -87,6 +88,26 @@ class PipelineConfig:
     tasks: list[str] = field(default_factory=lambda: ["t2va", "fl2va"])
     sigma_shift_video: float = 12.0
     sigma_shift_audio: float = 3.0
+
+    def with_sigma_shift_overrides(
+        self,
+        *,
+        video: float | None = None,
+        audio: float | None = None,
+    ) -> "PipelineConfig":
+        """Return a copy with explicit scheduler shifts for a Turbo/LoRA contract."""
+        updates: dict[str, float] = {}
+        for label, value, field_name in (
+            ("video", video, "sigma_shift_video"),
+            ("audio", audio, "sigma_shift_audio"),
+        ):
+            if value is None:
+                continue
+            numeric = float(value)
+            if not math.isfinite(numeric) or numeric <= 0:
+                raise ValueError(f"{label} sigma shift must be finite and positive, got {value!r}")
+            updates[field_name] = numeric
+        return replace(self, **updates) if updates else self
 
     @classmethod
     def from_model_index(cls, path: str | Path) -> "PipelineConfig":

@@ -154,6 +154,8 @@ class MiniMaxH3Pipeline:
         turbo_lora_path: str | Path | None = None,
         turbo_lora_alpha: float | None = None,
         turbo_lora_scale: float = 1.0,
+        sigma_shift_video: float | None = None,
+        sigma_shift_audio: float | None = None,
         memory_limit_gb: float = 16.0,
         block_load_mode: str = "mlx",
         stream_block_group_size: int = 1,
@@ -191,7 +193,10 @@ class MiniMaxH3Pipeline:
         stream_block_group_size = int(stream_block_group_size)
         if stream_block_group_size <= 0:
             raise ValueError(f"stream_block_group_size must be positive, got {stream_block_group_size}")
-        config = PipelineConfig.from_model_index(root / "model_index.json")
+        config = PipelineConfig.from_model_index(root / "model_index.json").with_sigma_shift_overrides(
+            video=sigma_shift_video,
+            audio=sigma_shift_audio,
+        )
 
         if memory_pressure_guard:
             _apply_mlx_pressure_limits(memory_limit_gb)
@@ -202,15 +207,18 @@ class MiniMaxH3Pipeline:
             mx.set_memory_limit(int(memory_limit_gb * 1e9))
             if memory_pressure_guard:
                 _apply_mlx_pressure_limits(memory_limit_gb)
-            text_path = Path(text_encoder_dir) if text_encoder_dir else root / "text_encoder-mlx-4bit"
-            if not (text_path / "quant_config.json").is_file():
-                raise FileNotFoundError(
-                    f"low-memory mode requires a quantized text encoder at {text_path}"
-                )
-            if not (dit_path / "quant_config.json").is_file():
-                raise FileNotFoundError(
-                    f"low-memory mode requires a quantized transformer at {dit_path}"
-                )
+            # Keep conditioning quality at the upstream precision by default. The encoder is
+            # instantiated only for the conditioning phase and streams one required decoder layer
+            # at a time, so the original BF16 checkpoint does not become resident as a whole.
+            text_path = Path(text_encoder_dir) if text_encoder_dir else root / "text_encoder"
+            if not (text_path / "config.json").is_file():
+                raise FileNotFoundError(f"text encoder checkpoint not found at {text_path}")
+            if not (text_path / "model.safetensors.index.json").is_file():
+                raise FileNotFoundError(f"indexed text encoder weights not found at {text_path}")
+            if not (dit_path / "config.json").is_file():
+                raise FileNotFoundError(f"transformer config not found at {dit_path}")
+            if not (dit_path / "model.safetensors.index.json").is_file():
+                raise FileNotFoundError(f"indexed transformer weights not found at {dit_path}")
             pipeline = cls(None, None, None, None, config)
             pipeline._memory_pressure_guard = bool(memory_pressure_guard)
             pipeline._memory_limit_gb = float(memory_limit_gb)
@@ -477,6 +485,7 @@ class MiniMaxH3Pipeline:
                     verbose=verbose,
                     tokenizer_dir=self._checkpoint_root / "tokenizer",
                     processor_dir=self._checkpoint_root / "processor",
+                    stream_layers=True,
                 ),
                 eval_output=False,
             )

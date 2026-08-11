@@ -5,7 +5,7 @@ Release-facing examples::
     ./.venv/bin/python scripts/generate.py "a red fox leaps over a mossy log" \
         --checkpoint models/MiniMax-H3/FL2VA \
         --transformer models/MiniMax-H3-MLX-4bit \
-        --text-encoder models/MiniMax-H3/FL2VA/text_encoder-mlx-4bit \
+        --text-encoder models/MiniMax-H3/FL2VA/text_encoder \
         --profile balanced --resolution 960x544 --output fox.mp4
 
 Read the performance section of the README first: a step at the released 768-pixel canvas is ~8.8
@@ -231,7 +231,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--text-encoder",
         default=None,
-        help=f"quantized H3 text encoder directory for --low-memory; may also be set with {TEXT_ENCODER_ENV_VAR}",
+        help=f"H3 text encoder directory; --low-memory defaults to upstream full-precision weights and streams them layer-by-layer; may also be set with {TEXT_ENCODER_ENV_VAR}",
     )
     parser.add_argument(
         "--turbo-lora",
@@ -245,6 +245,20 @@ def build_parser() -> argparse.ArgumentParser:
         help="legacy PEFT training alpha; omit for native MLX adapters, which record alpha=rank",
     )
     parser.add_argument("--turbo-lora-scale", type=float, default=1.0, help="runtime multiplier for --turbo-lora")
+    parser.add_argument(
+        "--sigma-shift-video",
+        "--video-shift",
+        type=float,
+        default=None,
+        help="video scheduler shift override required by some Turbo adapters",
+    )
+    parser.add_argument(
+        "--sigma-shift-audio",
+        "--audio-shift",
+        type=float,
+        default=None,
+        help="audio scheduler shift override required by some Turbo adapters",
+    )
     parser.add_argument("--memory-limit-gb", type=float, default=16.0, help="MLX allocation guideline for --low-memory")
     parser.add_argument(
         "--memory-pressure-guard",
@@ -371,6 +385,10 @@ def parse_args(argv: Sequence[str] | None = None, *, env: Mapping[str, str] | No
                 parser.error(str(exc))
     if args.memory_limit_gb <= 0:
         parser.error("--memory-limit-gb must be positive")
+    for name in ("sigma_shift_video", "sigma_shift_audio"):
+        value = getattr(args, name)
+        if value is not None and value <= 0:
+            parser.error(f"--{name.replace('_', '-')} must be positive")
     if args.block_cache_threshold < 0:
         parser.error("--block-cache-threshold must be non-negative")
     if not 0.0 <= args.block_cache_depth < 1.0:
@@ -413,6 +431,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             turbo_lora_path=args.turbo_lora,
             turbo_lora_alpha=args.turbo_lora_alpha,
             turbo_lora_scale=args.turbo_lora_scale,
+            sigma_shift_video=args.sigma_shift_video,
+            sigma_shift_audio=args.sigma_shift_audio,
             memory_limit_gb=args.memory_limit_gb,
             stream_block_group_size=args.stream_block_group_size,
             dense_dequant_profile=args.dense_dequant_profile,

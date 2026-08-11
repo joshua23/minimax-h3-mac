@@ -67,6 +67,20 @@ def test_profile_presets_parse_and_explicit_flags_win() -> None:
     assert_case("memory pressure guard remains opt-in", speed.memory_pressure_guard is False)
     assert_case("stream block group size keeps default one-block residency", speed.stream_block_group_size == 1)
     assert_case("dense-dequant generation profile remains opt-in", speed.dense_dequant_profile == "off")
+    assert_case("scheduler shifts preserve base defaults unless overridden", speed.sigma_shift_video is None and speed.sigma_shift_audio is None)
+    turbo_shifts = module.parse_args(
+        [
+            "a safe prompt",
+            "--checkpoint",
+            "models/upstream",
+            "--video-shift",
+            "6",
+            "--audio-shift",
+            "3",
+        ],
+        env={},
+    )
+    assert_case("Turbo scheduler shift aliases parse", turbo_shifts.sigma_shift_video == 6.0 and turbo_shifts.sigma_shift_audio == 3.0)
     parser = module.build_parser()
     block_loader_actions = [action for action in parser._actions if "--block-load-mode" in action.option_strings]
     assert_case("rejected selective block loader is absent from generation CLI", block_loader_actions == [])

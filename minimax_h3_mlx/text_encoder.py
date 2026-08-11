@@ -21,6 +21,7 @@ AdaLN modulation keys off.
 
 from __future__ import annotations
 
+import gc
 import glob
 import json
 from pathlib import Path
@@ -44,9 +45,10 @@ class MiniMaxH3TextEncoder:
         verbose: bool = False,
         tokenizer_dir: str | Path | None = None,
         processor_dir: str | Path | None = None,
+        stream_layers: bool = False,
     ):
         from mlx_vlm.models.qwen3_vl.config import ModelConfig, TextConfig, VisionConfig
-        from mlx_vlm.models.qwen3_vl.language import Qwen3VLModel
+        from mlx_vlm.models.qwen3_vl.language import Qwen3VLDecoderLayer, Qwen3VLModel
         from mlx_vlm.models.qwen3_vl.vision import VisionModel
 
         model_dir = Path(model_dir)
@@ -62,12 +64,18 @@ class MiniMaxH3TextEncoder:
                 "layers is post-norm and is not the conditioning MiniMax-H3 expects."
             )
 
+        if stream_layers and load_vision:
+            raise ValueError("streamed text-encoder loading currently supports text-only requests")
+
         self.num_layers = num_layers
         self.full_layers = full_layers
         self.dtype = dtype
+        self.stream_layers = bool(stream_layers)
 
         text_raw = dict(raw["text_config"])
-        text_raw["num_hidden_layers"] = num_layers  # build only what we evaluate
+        # Resident mode builds the 50 evaluated layers. Streamed mode builds only one reusable
+        # decoder-layer slot; its original BF16 weights are replaced before every layer forward.
+        text_raw["num_hidden_layers"] = 1 if self.stream_layers else num_layers
         self.text_config = TextConfig.from_dict(text_raw)
         self.vision_config = VisionConfig.from_dict(raw["vision_config"])
         self.model_config = ModelConfig.from_dict(
@@ -81,7 +89,8 @@ class MiniMaxH3TextEncoder:
         self.model_config.text_config = self.text_config
         self.model_config.vision_config = self.vision_config
 
-        self.language = Qwen3VLModel(self.text_config)
+        self.language = None if self.stream_layers else Qwen3VLModel(self.text_config)
+        self._stream_layer = Qwen3VLDecoderLayer(self.text_config, layer_idx=0) if self.stream_layers else None
         self.vision = VisionModel(self.vision_config) if load_vision else None
         quant_path = model_dir / "quant_config.json"
         self.quantized = quant_path.exists()
@@ -91,6 +100,7 @@ class MiniMaxH3TextEncoder:
 
             with quant_path.open() as handle:
                 quant = json.load(handle)
+            self.quant_config = quant
 
             def quantize_language(path, module):
                 weight = getattr(module, "weight", None)
@@ -108,8 +118,25 @@ class MiniMaxH3TextEncoder:
                     "mode": str(quant.get("mode", "affine")),
                 }
 
-            apply_quantized_slots(self.language, quantize_language)
-        self._load_weights(model_dir, dtype, verbose)
+            apply_quantized_slots(
+                self._stream_layer if self.stream_layers else self.language,
+                quantize_language,
+            )
+        if self.stream_layers:
+            from .selective_loading import load_weight_map
+
+            self._weight_map = load_weight_map(model_dir)
+            self.skipped_tensors = len(self._weight_map) - sum(
+                key == "model.language_model.embed_tokens.weight"
+                or any(key.startswith(f"model.language_model.layers.{i}.") for i in range(num_layers))
+                for key in self._weight_map
+            )
+            if verbose:
+                precision = "quantized" if self.quantized else "full-precision"
+                print(f"  text encoder: {precision} weights, streaming {num_layers} layers")
+        else:
+            self.quant_config = None
+            self._load_weights(model_dir, dtype, verbose)
 
         self.image_token_id = raw["image_token_id"]
         self.vision_start_token_id = raw["vision_start_token_id"]
@@ -279,6 +306,50 @@ class MiniMaxH3TextEncoder:
 
     # -- forward ---------------------------------------------------------------------------
 
+    def _load_stream_tensor(self, key: str) -> mx.array:
+        from .selective_loading import load_selected_mlx_tensors
+
+        if key not in self._weight_map:
+            raise KeyError(f"text encoder is missing streamed tensor {key!r}")
+        tensor = load_selected_mlx_tensors(self._model_dir, [key])[key]
+        return tensor if self.quantized else tensor.astype(self.dtype)
+
+    def _load_stream_layer(self, layer_idx: int) -> None:
+        from mlx.utils import tree_flatten, tree_unflatten
+        from .selective_loading import load_selected_mlx_tensors
+
+        layer = self._stream_layer
+        expected = {key for key, _ in tree_flatten(layer.parameters())}
+        # The previous layer's forward has already been evaluated. Remove its arrays before reading
+        # the next layer so peak residency is one layer rather than old+new during the handoff.
+        layer.update(tree_unflatten([(key, mx.array(0, dtype=mx.uint32)) for key in expected]))
+        gc.collect()
+        clear_cache = getattr(mx, "clear_cache", None)
+        if clear_cache is not None:
+            clear_cache()
+        prefix = f"model.language_model.layers.{layer_idx}."
+        source_by_target = {
+            key[len(prefix) :]: key for key in self._weight_map if key.startswith(prefix)
+        }
+        missing = sorted(expected - source_by_target.keys())
+        if missing:
+            raise KeyError(f"text encoder layer {layer_idx} is missing tensors, e.g. {missing[:4]}")
+        loaded = load_selected_mlx_tensors(
+            self._model_dir,
+            [source_by_target[key] for key in sorted(expected)],
+        )
+        updates = [
+            (
+                key,
+                loaded[source_by_target[key]]
+                if self.quantized
+                else loaded[source_by_target[key]].astype(self.dtype),
+            )
+            for key in sorted(expected)
+        ]
+        layer.update(tree_unflatten(updates))
+        mx.eval(*(tensor for _, tensor in updates))
+
     def _hidden_states(
         self,
         input_ids: mx.array,
@@ -289,6 +360,51 @@ class MiniMaxH3TextEncoder:
     ) -> mx.array:
         """Run the truncated stack and return the hidden state **before** the final norm."""
         from mlx_vlm.models.base import create_attention_mask
+
+        if self.stream_layers:
+            if inputs_embeds is not None or deepstack_visual_embeds is not None:
+                raise ValueError("streamed text encoder does not support vision embeddings")
+            embedding_key = "model.language_model.embed_tokens.weight"
+            embedding = self._load_stream_tensor(embedding_key)
+            if self.quantized:
+                from .selective_loading import load_selected_mlx_tensors
+
+                stem = embedding_key[: -len("weight")]
+                aux_keys = [stem + "scales", stem + "biases"]
+                aux = load_selected_mlx_tensors(self._model_dir, aux_keys)
+                # QuantizedEmbedding cannot be used as the streamed layer slot. Select the prompt
+                # rows while they are still packed, then dequantize only those rows; dequantizing
+                # the complete 151936 x 5120 table would defeat low-memory text streaming.
+                h = mx.dequantize(
+                    embedding[input_ids],
+                    aux[stem + "scales"][input_ids],
+                    aux[stem + "biases"][input_ids],
+                    group_size=int(self.quant_config["group_size"]),
+                    bits=int(self.quant_config["bits"]),
+                    mode=str(self.quant_config.get("mode", "affine")),
+                )
+                del aux
+            else:
+                h = embedding[input_ids]
+            mx.eval(h)
+            del embedding
+            gc.collect()
+            clear_cache = getattr(mx, "clear_cache", None)
+            if clear_cache is not None:
+                clear_cache()
+            mask = create_attention_mask(h, None)
+            layer = self._stream_layer
+            position_embeddings = None
+            if position_ids is not None and not layer.self_attn.rotary_emb.fused_apply:
+                position_embeddings = layer.self_attn.rotary_emb(h, position_ids)
+            for layer_idx in range(self.num_layers):
+                self._load_stream_layer(layer_idx)
+                h = layer(h, mask, None, position_ids, position_embeddings)
+                # Materialize before replacing this slot with the next layer's weights, ensuring
+                # that at most one full decoder layer is resident.
+                mx.eval(h)
+                gc.collect()
+            return h
 
         model = self.language
         h = model.embed_tokens(input_ids) if inputs_embeds is None else inputs_embeds
