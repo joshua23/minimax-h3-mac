@@ -394,6 +394,13 @@ The command above completed end to end on the same 24 GB M4 Pro MacBook Pro:
 
 The output passed a complete ffmpeg video/audio decode. Its AAC stream is active, non-silent, 32 kHz stereo. This calibrated INT8 release is a measured quality candidate, not a claim of mathematically lossless quantization.
 
+### More measured INT8 + MLX Turbo videos
+
+- **[Nai Long vs. Ultraman Belial: watch or download the 480×864 vertical video](examples/nailong-vs-belial-480x864/nailong-vs-belial-int8-mlx-turbo-480x864-6s.mp4)**
+- [Six-frame contact sheet](examples/nailong-vs-belial-480x864/contact-sheet.jpg) · [Full prompt](examples/nailong-vs-belial-480x864/prompt.txt)
+- Configuration: full BF16 text encoder, Argus INT8 DiT, native MLX BF16 Turbo, 4 NFE, 480×864, 6.575-second H.264 + AAC
+- SHA256: `9c17fdb2e85f37a4f7b836f17c950165378245fc01fca8051837d367fed5b4d8`
+
 ## 5. Reproducible Turbo conversion tool
 
 Normally, download `water1234/MiniMax-H3-Turbo-v4-step600-EMA-MLX` directly. To revalidate and package the original Larry release yourself:

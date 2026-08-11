@@ -396,6 +396,13 @@ caffeinate -dimsu .venv/bin/python scripts/generate.py \
 
 输出已经通过 ffmpeg 完整音视频解码检查；AAC 为 32kHz 双声道且有效非静音。该 INT8 是经过激活校准的质量候选，但量化本身不是数学无损。
 
+### 更多 INT8 + MLX Turbo 实测视频
+
+- **[奶龙大战贝利亚：点击观看或下载 480×864 竖屏视频](examples/nailong-vs-belial-480x864/nailong-vs-belial-int8-mlx-turbo-480x864-6s.mp4)**
+- [六帧预览图](examples/nailong-vs-belial-480x864/contact-sheet.jpg) · [完整提示词](examples/nailong-vs-belial-480x864/prompt.txt)
+- 配置：完整 BF16 Text Encoder、Argus INT8 DiT、原生 MLX BF16 Turbo、4 NFE、480×864、6.575 秒 H.264 + AAC
+- SHA256：`9c17fdb2e85f37a4f7b836f17c950165378245fc01fca8051837d367fed5b4d8`
+
 ## 5. 可复现的 Turbo 转换工具
 
 通常直接下载上面的 `water1234/MiniMax-H3-Turbo-v4-step600-EMA-MLX` 即可。如果需要从 Larry 原始发布重新验证和打包：
