@@ -13,6 +13,7 @@ from dataclasses import asdict
 from pathlib import Path
 
 import mlx.core as mx
+import mlx.nn as nn
 import numpy as np
 from mlx.utils import tree_flatten
 from safetensors.numpy import save_file
@@ -209,6 +210,47 @@ def write_mixed_streaming_checkpoint(root: Path) -> dict[str, np.ndarray]:
     return shard_tensors
 
 
+def write_bf16_exception_streaming_checkpoint(root: Path) -> str:
+    config = tiny_dit_config()
+    bf16_path = "blocks.1.attn.qkv_proj"
+    quant = QuantConfig(
+        bits=4,
+        group_size=4,
+        quantize_adaln=True,
+        adaln_bits=8,
+        overrides={bf16_path: None},
+    )
+    (root / "config.json").write_text(json.dumps(asdict(config)))
+    (root / "quant_config.json").write_text(
+        json.dumps(
+            {
+                "bits": quant.bits,
+                "group_size": quant.group_size,
+                "mode": quant.mode,
+                "quantize_adaln": quant.quantize_adaln,
+                "adaln_bits": quant.adaln_bits,
+                "bf16_layers": [bf16_path],
+            }
+        )
+    )
+    weight_map: dict[str, str] = {}
+    shard_tensors: dict[str, np.ndarray] = {}
+    for block_index in range(config.num_layers):
+        slot = _BlockSlot(config, quant, source_block_index=block_index)
+        for param_index, (target_key, value) in enumerate(tree_flatten(slot.parameters())):
+            source_key = f"blocks.{block_index}." + target_key[len("blocks.0.") :]
+            shard_tensors[source_key] = _array_for(
+                value,
+                offset=1000 * block_index + param_index,
+            )
+            weight_map[source_key] = "mixed-bf16.safetensors"
+    save_file(shard_tensors, str(root / "mixed-bf16.safetensors"))
+    (root / "model.safetensors.index.json").write_text(
+        json.dumps({"weight_map": weight_map})
+    )
+    return bf16_path
+
+
 def _slot_fingerprints(provider: QuantizedBlockProvider, *, include_adaln: bool = True, adaln_only: bool = False) -> dict[str, dict[str, object]]:
     flat = tree_flatten(provider.slot.parameters())
     mx.eval(*(value for _, value in flat))
@@ -256,6 +298,29 @@ def test_streaming_provider_rejects_archived_selective_mode() -> None:
                 f"provider mx.load logical bytes positive for {kwargs or {'include_adaln': True}}",
                 provider.logical_bytes_loaded > 0,
             )
+
+
+def test_streaming_provider_remaps_bf16_exceptions_to_reusable_slot() -> None:
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        write_bf16_exception_streaming_checkpoint(root)
+        provider = QuantizedBlockProvider(root)
+        block0 = provider.load_block(0)
+        assert_case(
+            "ordinary source block uses a quantized reusable slot",
+            isinstance(block0.attn.qkv_proj, nn.QuantizedLinear),
+        )
+        block1 = provider.load_block(1)
+        assert_case(
+            "BF16 source exception remaps onto blocks.0 reusable slot",
+            isinstance(block1.attn.qkv_proj, nn.Linear)
+            and not isinstance(block1.attn.qkv_proj, nn.QuantizedLinear),
+        )
+        block0_again = provider.load_block(0)
+        assert_case(
+            "reused slot returns to quantized structure",
+            isinstance(block0_again.attn.qkv_proj, nn.QuantizedLinear),
+        )
 
 
 def test_block_local_reshard_layout_matches_mx_load_and_uses_relative_index() -> None:
@@ -321,6 +386,7 @@ def main() -> int:
     test_unknown_key_is_explicit()
     test_mlx_bf16_selected_tensor_preserves_bits()
     test_streaming_provider_rejects_archived_selective_mode()
+    test_streaming_provider_remaps_bf16_exceptions_to_reusable_slot()
     test_block_local_reshard_layout_matches_mx_load_and_uses_relative_index()
     test_block_local_reshard_fails_on_missing_or_corrupt_source_tensor()
     print("selective loading focused tests passed")

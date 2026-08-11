@@ -127,7 +127,7 @@ class MiniMaxH3Pipeline:
         self._dit_path: Path | None = None
         self._text_encoder_path: Path | None = None
         self._turbo_lora_path: Path | None = None
-        self._turbo_lora_alpha = 8.0
+        self._turbo_lora_alpha: float | None = None
         self._turbo_lora_scale = 1.0
         self._block_load_mode = "mlx"
         self._stream_block_group_size = 1
@@ -152,7 +152,7 @@ class MiniMaxH3Pipeline:
         low_memory: bool = False,
         text_encoder_dir: str | Path | None = None,
         turbo_lora_path: str | Path | None = None,
-        turbo_lora_alpha: float = 8.0,
+        turbo_lora_alpha: float | None = None,
         turbo_lora_scale: float = 1.0,
         memory_limit_gb: float = 16.0,
         block_load_mode: str = "mlx",
@@ -245,7 +245,14 @@ class MiniMaxH3Pipeline:
             print(f"loading MiniMax-H3 from {root}")
         text_path = Path(text_encoder_dir) if text_encoder_dir else root / "text_encoder"
         text_encoder = step(
-            "text encoder", lambda: MiniMaxH3TextEncoder(text_path, dtype=dtype, load_vision=load_vision)
+            "text encoder",
+            lambda: MiniMaxH3TextEncoder(
+                text_path,
+                dtype=dtype,
+                load_vision=load_vision,
+                tokenizer_dir=root / "tokenizer",
+                processor_dir=root / "processor",
+            ),
         )
         if stream_blocks or turbo_lora_path is not None:
             dit, block_provider = step(
@@ -468,6 +475,8 @@ class MiniMaxH3Pipeline:
                     self._text_encoder_path,
                     load_vision=False,
                     verbose=verbose,
+                    tokenizer_dir=self._checkpoint_root / "tokenizer",
+                    processor_dir=self._checkpoint_root / "processor",
                 ),
                 eval_output=False,
             )

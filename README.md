@@ -179,6 +179,90 @@ python scripts/generate.py "a red fox leaps over a mossy log" -o fox.mp4 \
 The core is quantized at the named width; `adaln_proj` is held at 8-bit in every build, which costs
 0.25% on the modulation table and takes 12.2 GB off each download.
 
+### Argus calibration-aware INT8 profile
+
+The final quality-first profile uses real MiniMax-H3 activations to fit MLX-native weight-only affine
+INT8 at group size 32. It minimizes a diagonal-Hessian approximation to projection output error,
+keeps the ordinary MLX round-to-nearest group whenever the refit is not better, and permits only a
+small, recorded set of sensitivity-selected BF16 projections. Packed weights remain directly
+loadable by `mlx.nn.QuantizedLinear` and the one-block-at-a-time 24 GB path.
+
+```bash
+REV=939557dc319dd91227e30195a763f272ba7f8765
+
+CUDA_VISIBLE_DEVICES=1 python scripts/calibrate_int8_torch.py \
+  --checkpoint /path/to/MiniMax-H3/FL2VA \
+  --source-revision "$REV" \
+  --steps 6 \
+  --out calibration.npz \
+  --report calibration-cuda.json
+
+CUDA_VISIBLE_DEVICES=1 python scripts/verify_cuda_optimizer.py \
+  --checkpoint /path/to/MiniMax-H3/FL2VA/transformer \
+  --calibration calibration.npz \
+  --out cuda-optimizer-parity.json
+
+CUDA_VISIBLE_DEVICES=1 python scripts/build_calibrated_int8.py \
+  --checkpoint /path/to/MiniMax-H3/FL2VA \
+  --calibration calibration.npz \
+  --source-revision "$REV" \
+  --optimizer cuda --cuda-device cuda:0 \
+  --out /path/to/MiniMax-H3-MLX-Argus-Calibrated-INT8 \
+  --report calibrated-build.json
+
+./.venv/bin/python scripts/audit_quant.py \
+  /path/to/MiniMax-H3-MLX-Argus-Calibrated-INT8 --hash --out int8-audit.json
+```
+
+The CUDA collector runs the DiT teacher in FP32 after releasing the one-time BF16 text conditioner,
+records hooks under the original MLX module paths, and writes the FP32 `ActivationDataset` NPZ schema.
+The CUDA optimizer then uploads one BF16 dense layer and its FP32 rows at a time, computes the
+diagonal Hessian and three affine refits, retains only groups that beat native MLX RTN, and emits the
+MLX little-endian packed ABI with the original auxiliary dtype. `verify_cuda_optimizer.py` requires
+objective, packed-weight, scale/bias, and dequantized-output parity on tiny data and a complete real
+block-0 projection. CUDA is a build-time accelerator only; deployed inference remains pure MLX.
+
+`quant_config.json` records the calibration split, objective improvement, BF16 exceptions, source
+revision/config hash, repository state, environment, and implementation hashes. `audit_quant.py`
+verifies index ownership, payload bounds, packed `U32` weights, scales, affine biases, recipe, layer
+count, and optional per-file SHA-256 without allocating payloads. The older
+`build_quant.py --profile m4-pro-quality-int8` path is retained only as the plain group-32 RTN
+baseline. The holdout comparison and M4 invocation are documented in
+[Wiki/INT8-DiT.md](Wiki/INT8-DiT.md).
+
+### Native BF16 Turbo adapter on an INT8 DiT
+
+The quality build keeps Larry's v4-step600 EMA Turbo adapter in BF16 and applies it at runtime; it
+is never merged into the INT8 base and never requantized. Convert the pinned source into the native
+fused H3 key layout plus one shard per streamed component:
+
+```bash
+python scripts/convert_turbo_lora_to_mlx.py \
+  --source /path/to/minimax_h3_turbo_v4_step600_ema.safetensors \
+  --config /path/to/MiniMax-H3/FL2VA/transformer/config.json \
+  --output-dir /path/to/MiniMax-H3-Turbo-v4-step600-EMA-MLX \
+  --source-repo larryvrh/MiniMax-H3-Turbo-Lora \
+  --source-revision 43a74557ac3f6539db8e0f2a959d03feb7a81480
+```
+
+The native adapter records `alpha=rank`, so do not pass a fixed `--turbo-lora-alpha`. Main
+attention/MLP targets use rank 64; block and final AdaLN use rank 16. The streaming index contains
+50 main-block shards, two refiner shards, and one final-layer shard, keeping only the current BF16
+LoRA component resident.
+
+```bash
+python scripts/generate.py "A cinematic fox running through a misty forest" \
+  --checkpoint /path/to/MiniMax-H3/FL2VA \
+  --transformer /path/to/MiniMax-H3-MLX-Argus-Calibrated-INT8 \
+  --text-encoder /path/to/MiniMax-H3-MLX-M4Pro-TextEncoder-INT8 \
+  --turbo-lora /path/to/MiniMax-H3-Turbo-v4-step600-EMA-MLX \
+  --turbo-lora-scale 1.0 --steps 9 --low-memory --stream-blocks \
+  --output out.mp4
+```
+
+`--steps 9` is eight denoiser evaluations. Use `--steps 7` for six evaluations when latency matters
+more than the v4 adapter's best-quality setting.
+
 **3-bit and 2-bit are not published.** 3-bit was built and rendered: at 16.3 dB PSNR the subject is
 destroyed — no animal, no log, just a textured field. It does not fail by blurring, so a sharpness
 check would have passed it: per-frame variance *rises* to 54.7 against bfloat16's 37.1 as structure
@@ -390,10 +474,18 @@ scripts/
   build_unquantized.py  bf16 (native mixed) / f32 builds
   eval_quant.py         teacher-forced paired comparison across widths
   eval_adaln_quant.py   how far quantizing adaln_proj moves the modulation table
+  eval_int8_linear_quality.py  block-local real-weight INT8 fidelity comparison
+  probe_real_cuda_parity.py   real block-0 PyTorch/CUDA-to-MLX mapping gate
+  calibrate_int8_torch.py     FP32 CUDA DiT teacher activation collector
+  activation_quant_torch.py   single-layer CUDA affine optimizer
+  verify_cuda_optimizer.py    tiny + real-layer CPU/CUDA optimizer parity
+  build_calibrated_int8.py    CUDA-built, MLX-native activation-aware INT8
+  verify_calibrated_int8.py   strict load and finite real-prompt full-DiT proof
+  audit_quant.py        header-only packed-weight and hash audit
   bench_dit.py          per-block timing at realistic packed lengths
   upload.py             publish to the Hub; refuses to run without the upstream LICENSE
   make_collection.py    build/refresh the Hub collection
-  run_tests.sh          all seven suites
+  run_tests.sh          task-native parity, smoke, quantization and deployment suites
 
 tests/           parity vs the reference, quant round-trip, smoke
 ```

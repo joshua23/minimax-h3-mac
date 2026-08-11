@@ -42,6 +42,8 @@ class MiniMaxH3TextEncoder:
         dtype: mx.Dtype = mx.bfloat16,
         load_vision: bool = True,
         verbose: bool = False,
+        tokenizer_dir: str | Path | None = None,
+        processor_dir: str | Path | None = None,
     ):
         from mlx_vlm.models.qwen3_vl.config import ModelConfig, TextConfig, VisionConfig
         from mlx_vlm.models.qwen3_vl.language import Qwen3VLModel
@@ -103,6 +105,7 @@ class MiniMaxH3TextEncoder:
                 return {
                     "group_size": int(quant["group_size"]),
                     "bits": int(quant["bits"]),
+                    "mode": str(quant.get("mode", "affine")),
                 }
 
             apply_quantized_slots(self.language, quantize_language)
@@ -116,6 +119,17 @@ class MiniMaxH3TextEncoder:
         self._tokenizer = None
         self._processor = None
         self._model_dir = model_dir
+        root = model_dir.parent
+        self._tokenizer_dir = (
+            Path(tokenizer_dir)
+            if tokenizer_dir is not None
+            else (root / "tokenizer" if (root / "tokenizer").exists() else model_dir)
+        )
+        self._processor_dir = (
+            Path(processor_dir)
+            if processor_dir is not None
+            else (root / "processor" if (root / "processor").exists() else model_dir)
+        )
 
     # -- loading ---------------------------------------------------------------------------
 
@@ -192,9 +206,19 @@ class MiniMaxH3TextEncoder:
         if self._tokenizer is None:
             from transformers import AutoTokenizer
 
-            root = self._model_dir.parent
-            path = root / "tokenizer" if (root / "tokenizer").exists() else self._model_dir
-            self._tokenizer = AutoTokenizer.from_pretrained(str(path))
+            tokenizer = AutoTokenizer.from_pretrained(str(self._tokenizer_dir))
+            required_token_id = max(
+                self.image_token_id,
+                self.vision_start_token_id,
+                self.vision_end_token_id,
+            )
+            if len(tokenizer) <= required_token_id:
+                raise ValueError(
+                    f"Tokenizer at {self._tokenizer_dir} has only {len(tokenizer)} tokens, "
+                    f"but the checkpoint requires token id {required_token_id}. "
+                    "Pass the source FL2VA tokenizer directory via `tokenizer_dir`."
+                )
+            self._tokenizer = tokenizer
         return self._tokenizer
 
     @property
@@ -202,7 +226,7 @@ class MiniMaxH3TextEncoder:
         if self._processor is None:
             from transformers import AutoProcessor
 
-            self._processor = AutoProcessor.from_pretrained(str(self._model_dir.parent / "processor"))
+            self._processor = AutoProcessor.from_pretrained(str(self._processor_dir))
         return self._processor
 
     # -- request presentation --------------------------------------------------------------
@@ -241,6 +265,11 @@ class MiniMaxH3TextEncoder:
         prompt_ids = self.tokenizer(prompt, add_special_tokens=False)["input_ids"]
         token_ids += prompt_ids
         token_tags += [TAG_TEXT] * len(prompt_ids)
+        if not token_ids:
+            raise ValueError(
+                "The request produced no input token IDs. Check `tokenizer_dir` and provide "
+                "a prompt that tokenizes to at least one token."
+            )
 
         return (
             mx.array(np.array([token_ids], dtype=np.int32)),

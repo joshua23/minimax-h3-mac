@@ -91,7 +91,10 @@ class ModulationCache:
         tables: list[tuple[mx.array, ...]] = []
         for index in range(block_provider.block_count):
             block = block_provider.load_block(index, adaln_only=True)
-            table = tuple(t.astype(dtype) for t in block.adaln_proj(temb))
+            table = tuple(
+                t.astype(dtype)
+                for t in block.adaln_proj(temb, lora=block_provider.current_lora)
+            )
             mx.eval(table)
             tables.append(table)
         return cls(tables, timesteps)

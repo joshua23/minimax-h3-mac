@@ -91,8 +91,10 @@ def load_dit(
             QuantConfig(
                 bits=recipe["bits"],
                 group_size=recipe["group_size"],
+                mode=recipe.get("mode", "affine"),
                 quantize_adaln=recipe.get("quantize_adaln", False),
                 adaln_bits=recipe.get("adaln_bits") or 8,
+                overrides={path: None for path in recipe.get("bf16_layers", [])},
             ),
         )
         if verbose:

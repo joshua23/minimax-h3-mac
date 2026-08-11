@@ -24,7 +24,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 UPSTREAM = "MiniMaxAI/MiniMax-H3"
-CODE_REPO = "https://github.com/PipeNetwork/minimax-h3-mlx"
+CODE_REPO = "https://github.com/Argus-AiTeam/minimax-h3-mac"
 
 CARD = """---
 license: other
@@ -60,7 +60,7 @@ code, not just these weights:
 
 ```bash
 git clone {code_repo}
-cd minimax-h3-mlx && pip install -r requirements.txt
+cd minimax-h3-mac && pip install -r requirements.txt
 python scripts/generate.py "a red fox leaps over a mossy log" -o fox.mp4
 ```
 

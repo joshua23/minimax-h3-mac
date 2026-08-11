@@ -30,6 +30,9 @@ class LoRAWeights:
     tensors: dict[str, tuple[mx.array, mx.array]]
     multiplier: float
 
+    def has(self, target: str) -> bool:
+        return target in self.tensors
+
     def apply(self, target: str, inputs: mx.array) -> mx.array:
         lora_a, lora_b = self.tensors[target]
         hidden = inputs.astype(lora_a.dtype) @ lora_a.T

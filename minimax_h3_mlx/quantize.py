@@ -40,7 +40,7 @@ Norms and biases stay in their original precision throughout, as MLX's quantizer
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace as dataclass_replace
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -72,12 +72,13 @@ class QuantConfig:
 
     bits: int = 4
     group_size: int = 64
+    mode: str = "affine"
     #: Quantize the per-block AdaLN projections too. Off by default — see the module docstring.
     quantize_adaln: bool = False
     #: Bits for `adaln_proj` when `quantize_adaln` is set; kept higher than the core deliberately.
     adaln_bits: int = 8
     #: Layers whose quantization is overridden, by exact module path.
-    overrides: dict[str, int] = field(default_factory=dict)
+    overrides: dict[str, int | None] = field(default_factory=dict)
 
     def bits_for(self, path: str) -> int | None:
         """Bit width for a module path, or ``None`` to leave it unquantized."""
@@ -92,6 +93,24 @@ class QuantConfig:
         if any(path.endswith(suffix) for suffix in CORE_LINEARS):
             return self.bits
         return None
+
+    def for_block_slot(self, source_block_index: int) -> "QuantConfig":
+        """Map one source block's exact overrides onto a reusable ``blocks.0`` slot."""
+
+        source_prefix = f"blocks.{int(source_block_index)}."
+        mapped = {
+            path: bits
+            for path, bits in self.overrides.items()
+            if not path.startswith("blocks.")
+        }
+        mapped.update(
+            {
+                f"blocks.0.{path[len(source_prefix):]}": bits
+                for path, bits in self.overrides.items()
+                if path.startswith(source_prefix)
+            }
+        )
+        return dataclass_replace(self, overrides=mapped)
 
 
 def _class_predicate(config: QuantConfig, counts: dict[int, int] | None = None, verbose: bool = False):
@@ -111,7 +130,7 @@ def _class_predicate(config: QuantConfig, counts: dict[int, int] | None = None, 
             return False
         if counts is not None:
             counts[bits] = counts.get(bits, 0) + 1
-        return {"group_size": config.group_size, "bits": bits}
+        return {"group_size": config.group_size, "bits": bits, "mode": config.mode}
 
     return predicate
 
@@ -128,12 +147,13 @@ def apply_quantized_slots(model, class_predicate) -> None:
 
         group_size = int(params["group_size"])
         bits = int(params["bits"])
+        mode = str(params["mode"])
         if isinstance(module, nn.Linear):
             slot = nn.QuantizedLinear.__new__(nn.QuantizedLinear)
             nn.Module.__init__(slot)
             slot.group_size = group_size
             slot.bits = bits
-            slot.mode = "affine"
+            slot.mode = mode
             slot.weight = mx.zeros((1,), dtype=mx.uint32)
             slot.scales = mx.zeros((1,), dtype=mx.float16)
             slot.biases = mx.zeros((1,), dtype=mx.float16)
@@ -144,7 +164,7 @@ def apply_quantized_slots(model, class_predicate) -> None:
             nn.Module.__init__(slot)
             slot.group_size = group_size
             slot.bits = bits
-            slot.mode = "affine"
+            slot.mode = mode
             slot.weight = mx.zeros((1,), dtype=mx.uint32)
             slot.scales = mx.zeros((1,), dtype=mx.float16)
             slot.biases = mx.zeros((1,), dtype=mx.float16)
@@ -182,6 +202,7 @@ def quantize_dit(model, config: QuantConfig | None = None, verbose: bool = False
         model,
         group_size=config.group_size,
         bits=config.bits,
+        mode=config.mode,
         class_predicate=_class_predicate(config, counts, verbose),
     )
     mx.eval(model.parameters())
@@ -190,6 +211,7 @@ def quantize_dit(model, config: QuantConfig | None = None, verbose: bool = False
     summary = {
         "bits": config.bits,
         "group_size": config.group_size,
+        "mode": config.mode,
         "quantized_layers": dict(sorted(counts.items())),
         "gb_before": before,
         "gb_after": after,

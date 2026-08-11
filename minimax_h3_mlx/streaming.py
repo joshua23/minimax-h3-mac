@@ -39,10 +39,18 @@ def _normalize_block_load_mode(mode: str) -> str:
 class _BlockSlot(nn.Module):
     """One reusable block under the same `blocks.0` path as a checkpoint."""
 
-    def __init__(self, config: DiTConfig, quantization: QuantConfig) -> None:
+    def __init__(
+        self,
+        config: DiTConfig,
+        quantization: QuantConfig,
+        source_block_index: int = 0,
+    ) -> None:
         super().__init__()
         self.blocks = [TransformerBlock(config)]
-        apply_quantization_structure(self, quantization)
+        apply_quantization_structure(
+            self,
+            quantization.for_block_slot(source_block_index),
+        )
 
 
 class QuantizedBlockProvider:
@@ -73,12 +81,25 @@ class QuantizedBlockProvider:
         self.quantization = QuantConfig(
             bits=int(raw_quant["bits"]),
             group_size=int(raw_quant["group_size"]),
+            mode=str(raw_quant.get("mode", "affine")),
             quantize_adaln=bool(raw_quant.get("quantize_adaln", False)),
             adaln_bits=int(raw_quant.get("adaln_bits") or 8),
+            overrides={path: None for path in raw_quant.get("bf16_layers", [])},
         )
         with (self.model_dir / "model.safetensors.index.json").open() as handle:
             self.weight_map = json.load(handle)["weight_map"]
-        self.slots = [_BlockSlot(self.config, self.quantization) for _ in range(self.stream_block_group_size)]
+        initial_indices = [
+            min(index, self.config.num_layers - 1)
+            for index in range(self.stream_block_group_size)
+        ]
+        self.slots = [
+            _BlockSlot(self.config, self.quantization, source_block_index=index)
+            for index in initial_indices
+        ]
+        self._slot_overrides = [
+            self.quantization.for_block_slot(index).overrides
+            for index in initial_indices
+        ]
         self.slot = self.slots[0]
         self.expected = {key for key, _ in tree_flatten(self.slot.parameters())}
         self.current_index: int | None = None
@@ -88,6 +109,7 @@ class QuantizedBlockProvider:
         self.current_lora = None
         self.turbo_lora = None
         self.refiner_loras = None
+        self.final_lora = None
         self.logical_bytes_loaded = 0
         self.group_load_count = 0
         self.shard_load_count = 0
@@ -121,33 +143,70 @@ class QuantizedBlockProvider:
         self,
         path: str | Path,
         *,
-        alpha: float = 8.0,
+        alpha: float | None = None,
         scale: float = 1.0,
     ) -> None:
-        from .turbo_lora import TurboLoRAProvider
+        path = Path(path)
+        if path.is_dir():
+            from .native_turbo_lora import NativeTurboLoRAProvider
 
-        self.turbo_lora = TurboLoRAProvider(
-            path,
-            num_blocks=self.config.num_layers,
-            num_refiner_blocks=self.config.token_refiner_num_layers,
-            hidden_size=self.config.hidden_size,
-            inner_dim=self.config.inner_dim,
-            ffn_hidden_size=self.config.ffn_hidden_size,
-            alpha=alpha,
-            scale=scale,
-        )
+            if alpha is not None:
+                raise ValueError(
+                    "native Turbo records alpha=rank per target; do not pass a fixed alpha"
+                )
+            self.turbo_lora = NativeTurboLoRAProvider(
+                path,
+                num_blocks=self.config.num_layers,
+                num_refiner_blocks=self.config.token_refiner_num_layers,
+                scale=scale,
+            )
+            self.final_lora = self.turbo_lora.load_final()
+        else:
+            from .turbo_lora import TurboLoRAProvider
+
+            self.turbo_lora = TurboLoRAProvider(
+                path,
+                num_blocks=self.config.num_layers,
+                num_refiner_blocks=self.config.token_refiner_num_layers,
+                hidden_size=self.config.hidden_size,
+                inner_dim=self.config.inner_dim,
+                ffn_hidden_size=self.config.ffn_hidden_size,
+                alpha=8.0 if alpha is None else alpha,
+                scale=scale,
+            )
+            self.final_lora = None
         self.refiner_loras = self.turbo_lora.load_refiners()
 
     @property
     def block_count(self) -> int:
         return self.config.num_layers
 
-    def _expected_for_load(self, *, include_adaln: bool, adaln_only: bool) -> set[str]:
+    def _ensure_slot_structure(self, slot_index: int, block_index: int) -> None:
+        mapped = self.quantization.for_block_slot(block_index)
+        if self._slot_overrides[slot_index] != mapped.overrides:
+            self.slots[slot_index] = _BlockSlot(
+                self.config,
+                self.quantization,
+                source_block_index=block_index,
+            )
+            self._slot_overrides[slot_index] = mapped.overrides
+        if slot_index == 0:
+            self.slot = self.slots[0]
+            self.expected = {key for key, _ in tree_flatten(self.slot.parameters())}
+
+    @staticmethod
+    def _expected_for_load(
+        slot: _BlockSlot,
+        *,
+        include_adaln: bool,
+        adaln_only: bool,
+    ) -> set[str]:
+        expected = {key for key, _ in tree_flatten(slot.parameters())}
         if adaln_only:
-            return {key for key in self.expected if ".adaln_proj." in key}
+            return {key for key in expected if ".adaln_proj." in key}
         if include_adaln:
-            return self.expected
-        return {key for key in self.expected if ".adaln_proj." not in key}
+            return expected
+        return {key for key in expected if ".adaln_proj." not in key}
 
     def _slot_for_loaded_index(self, index: int) -> _BlockSlot:
         if self.current_group_start is None or self.current_group_end is None:
@@ -173,9 +232,10 @@ class QuantizedBlockProvider:
         )
 
     def _set_current_lora(self, index: int, *, adaln_only: bool) -> None:
+        del adaln_only
         self.current_lora = (
             self.turbo_lora.load_block(index)
-            if self.turbo_lora is not None and not adaln_only
+            if self.turbo_lora is not None
             else None
         )
 
@@ -202,7 +262,16 @@ class QuantizedBlockProvider:
 
         group_start = (index // self.stream_block_group_size) * self.stream_block_group_size
         group_end = min(group_start + self.stream_block_group_size, self.block_count)
-        expected = self._expected_for_load(include_adaln=include_adaln, adaln_only=adaln_only)
+        for offset, block_index in enumerate(range(group_start, group_end)):
+            self._ensure_slot_structure(offset, block_index)
+        expected_by_slot = [
+            self._expected_for_load(
+                self.slots[offset],
+                include_adaln=include_adaln,
+                adaln_only=adaln_only,
+            )
+            for offset in range(group_end - group_start)
+        ]
         updates_by_slot: list[list[tuple[str, mx.array]]] = [[] for _ in range(group_end - group_start)]
         found_by_slot: list[set[str]] = [set() for _ in range(group_end - group_start)]
         key_routes: dict[str, tuple[int, str]] = {}
@@ -218,7 +287,7 @@ class QuantizedBlockProvider:
                 source_keys = [key for key in source_keys if ".adaln_proj." not in key]
             for source_key in source_keys:
                 target_key = target_prefix + source_key[len(source_prefix) :]
-                if target_key not in self.expected:
+                if target_key not in expected_by_slot[slot_index]:
                     raise KeyError(f"streaming slot has no parameter {target_key!r}")
                 key_routes[source_key] = (slot_index, target_key)
                 by_shard.setdefault(self.weight_map[source_key], []).append(source_key)
@@ -234,7 +303,7 @@ class QuantizedBlockProvider:
                 self.logical_bytes_loaded += tensor.nbytes
 
         for offset, block_index in enumerate(range(group_start, group_end)):
-            missing = sorted(expected - found_by_slot[offset])
+            missing = sorted(expected_by_slot[offset] - found_by_slot[offset])
             if missing:
                 raise KeyError(f"block {block_index} is missing {len(missing)} tensors, e.g. {missing[:4]}")
             slot = self.slots[offset]
@@ -254,7 +323,7 @@ def load_streaming_dit(
     model_dir: str | Path,
     *,
     turbo_lora_path: str | Path | None = None,
-    turbo_lora_alpha: float = 8.0,
+    turbo_lora_alpha: float | None = None,
     turbo_lora_scale: float = 1.0,
     block_load_mode: str = "mlx",
     stream_block_group_size: int = 1,

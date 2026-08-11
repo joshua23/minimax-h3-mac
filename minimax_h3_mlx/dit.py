@@ -31,6 +31,7 @@ import math
 import mlx.core as mx
 import mlx.nn as nn
 
+from .activation_quant import project_linear
 from .block_cache import BlockResidualCache
 from .config import MODALITY_NUM, DiTConfig
 from .forward_profile import profiled_call
@@ -1372,7 +1373,7 @@ class Attention(nn.Module):
             return tiled_dense_linear_projection(self.qkv_proj, x, self.qkv_tiled_output_channels)
         if self.use_qkv_2d_projection_candidate:
             return linear_rank3_input_as_rank2(self.qkv_proj, x)
-        return self.qkv_proj(x)
+        return project_linear(self.qkv_proj, x)
 
     def qkv_headgroup_row_sliced_qmm_info(self, heads_per_slice: int | None = None) -> dict[str, object]:
         """Return metadata for the whole-head-group row-sliced ``qkv_proj`` QMM probe."""
@@ -1687,7 +1688,7 @@ class Attention(nn.Module):
             return tiled_dense_linear_projection(self.out_proj, x, self.out_tiled_output_channels)
         if self.use_out_2d_projection_candidate and lora is None:
             return linear_rank3_input_as_rank2(self.out_proj, x)
-        return self.out_proj(x)
+        return project_linear(self.out_proj, x)
 
     def _qkv_sdpa_tensors(self, x: mx.array, lora=None) -> tuple[mx.array, mx.array, mx.array]:
         """Project QKV and return ``q, k, v`` in ``[B, H, S, D]`` SDPA layout.
@@ -1729,8 +1730,19 @@ class Attention(nn.Module):
 
         # Raw-checkpoint QKV rows are per-head interleaved: (..., heads, 3, head_dim).
         def qk_norm_v_layout() -> tuple[mx.array, mx.array, mx.array]:
-            q, k, v = qkv[:, :, :, 0], qkv[:, :, :, 1], qkv[:, :, :, 2]
-            if lora is not None:
+            if lora is not None and lora.has("attn.qkv_proj"):
+                native_delta = lora.apply("attn.qkv_proj", x).reshape(
+                    B, S, self.heads, 3, self.head_dim
+                )
+                qkv_with_lora = qkv + native_delta
+            else:
+                qkv_with_lora = qkv
+            q, k, v = (
+                qkv_with_lora[:, :, :, 0],
+                qkv_with_lora[:, :, :, 1],
+                qkv_with_lora[:, :, :, 2],
+            )
+            if lora is not None and not lora.has("attn.qkv_proj"):
                 q = q + lora.apply("attn.to_q", x).reshape(B, S, self.heads, self.head_dim)
                 k = k + lora.apply("attn.to_k", x).reshape(B, S, self.heads, self.head_dim)
                 v = v + lora.apply("attn.to_v", x).reshape(B, S, self.heads, self.head_dim)
@@ -1854,7 +1866,10 @@ class Attention(nn.Module):
             lambda: self._out_project(out.astype(x.dtype), lora=lora),
             metadata={"sequence_length": S, "input_features": self._inner, "output_features": self._hidden},
         )
-        return projected + lora.apply("attn.to_out.0", out) if lora is not None else projected
+        if lora is None:
+            return projected
+        target = "attn.out_proj" if lora.has("attn.out_proj") else "attn.to_out.0"
+        return projected + lora.apply(target, out)
 
 
 class FeedForward(nn.Module):
@@ -1925,7 +1940,7 @@ class FeedForward(nn.Module):
             return dense_linear_projection(self.fc1, x, self._fc1_dense_dequant_weight())
         if (self.use_ffn_2d_projection_candidate or self.use_ffn_fc1_rank2_qmm_candidate) and lora is None:
             return linear_rank3_input_as_rank2(self.fc1, x)
-        return self.fc1(x)
+        return project_linear(self.fc1, x)
 
     def fc1_split_gate_value_quantized_qmm_info(self) -> dict[str, object]:
         """Return metadata for the split gate/value ``fc1`` output-row QMM probe."""
@@ -2434,7 +2449,7 @@ class FeedForward(nn.Module):
             return dense_linear_projection(self.fc2, hidden, self._fc2_dense_dequant_weight())
         if (self.use_ffn_2d_projection_candidate or self.use_ffn_fc2_rank2_qmm_candidate) and lora is None:
             return linear_rank3_input_as_rank2(self.fc2, hidden)
-        return self.fc2(hidden)
+        return project_linear(self.fc2, hidden)
 
     def _swiglu_hidden(self, fused: mx.array, x: mx.array | None = None, lora=None) -> mx.array:
         if self.use_ffn_metal_swiglu_candidate and lora is None and not self.use_mx_split_swiglu_candidate:
@@ -2446,8 +2461,12 @@ class FeedForward(nn.Module):
         if lora is not None:
             if x is None:
                 raise ValueError("LoRA SwiGLU path requires the pre-projection input")
-            # Diffusers' fused projection stores [value; gate], opposite to the raw H3 block.
-            value_delta, gate_delta = mx.split(lora.apply("ff.net.0.proj", x), 2, axis=-1)
+            if lora.has("mlp.fc1"):
+                # Native H3 uses the same fused [gate; value] order as the base projection.
+                gate_delta, value_delta = mx.split(lora.apply("mlp.fc1", x), 2, axis=-1)
+            else:
+                # Diffusers stores the fused LoRA output as [value; gate].
+                value_delta, gate_delta = mx.split(lora.apply("ff.net.0.proj", x), 2, axis=-1)
             gate = gate + gate_delta
             value = value + value_delta
         return nn.silu(gate) * value
@@ -2586,7 +2605,10 @@ class FeedForward(nn.Module):
             lambda: self._fc2_project(hidden, lora=lora),
             metadata={"sequence_length": x.shape[-2], "hidden_size": self._hidden, "ffn_hidden_size": self._ffn},
         )
-        return projected + lora.apply("ff.net.2", hidden) if lora is not None else projected
+        if lora is None:
+            return projected
+        target = "mlp.fc2" if lora.has("mlp.fc2") else "ff.net.2"
+        return projected + lora.apply(target, hidden)
 
 
 class AdaLayerNormModulation(nn.Module):
@@ -2607,10 +2629,13 @@ class AdaLayerNormModulation(nn.Module):
         self.hidden_size = config.hidden_size
         self.linear = nn.Linear(config.time_embed_dim, config.adaln_out_features, bias=True)
 
-    def __call__(self, temb: mx.array) -> tuple[mx.array, ...]:
+    def __call__(self, temb: mx.array, lora=None) -> tuple[mx.array, ...]:
         # Activate at `temb`'s own (float32) precision, cast to the projection's dtype after.
-        h = nn.silu(temb).astype(param_dtype(self.linear))
-        h = self.linear(h).reshape(-1, 6 * self.hidden_size)
+        activated = nn.silu(temb).astype(param_dtype(self.linear))
+        h = project_linear(self.linear, activated)
+        if lora is not None and lora.has("adaln_proj.linear"):
+            h = h + lora.apply("adaln_proj.linear", activated)
+        h = h.reshape(-1, 6 * self.hidden_size)
         return tuple(h[..., i * self.hidden_size : (i + 1) * self.hidden_size] for i in range(6))
 
 
@@ -2637,8 +2662,17 @@ class FinalLayer(nn.Module):
         self.audio_out = nn.Linear(config.hidden_size, config.audio_latents_dim, bias=True)
         self.hidden_size = config.hidden_size
 
-    def norm_out(self, x: mx.array, temb: mx.array, timestep_indices: mx.array) -> mx.array:
-        h = self.adaln_proj.linear(nn.silu(temb).astype(param_dtype(self.adaln_proj.linear)))
+    def norm_out(
+        self,
+        x: mx.array,
+        temb: mx.array,
+        timestep_indices: mx.array,
+        lora=None,
+    ) -> mx.array:
+        activated = nn.silu(temb).astype(param_dtype(self.adaln_proj.linear))
+        h = self.adaln_proj.linear(activated)
+        if lora is not None and lora.has("final_layer.adaln_proj.linear"):
+            h = h + lora.apply("final_layer.adaln_proj.linear", activated)
         shift, scale = h[..., : self.hidden_size], h[..., self.hidden_size :]
         x = self.norm(x)
         return x * (1.0 + scale[timestep_indices]) + shift[timestep_indices]
@@ -3062,17 +3096,17 @@ class MiniMaxH3DiT(nn.Module):
                     if block_provider is not None
                     else self.blocks[i]
                 )
+                lora = block_provider.current_lora if block_provider is not None else None
                 modulation = (
                     modulation_cache.get(i)
                     if modulation_cache is not None
                     else profiled_call(
                         "block.adaln_projection",
                         "adaln_norm_residual",
-                        lambda: block.adaln_proj(temb),
+                        lambda: block.adaln_proj(temb, lora=lora),
                         metadata={"block_index": i, "distinct_timestep_count": timestep.shape[0]},
                     )
                 )
-                lora = block_provider.current_lora if block_provider is not None else None
                 hidden = block(hidden, modulation, adaln_indices, rotary, mask, lora)
                 if block_provider is not None:
                     # Materialize before the reusable slot is rebound to the next block.
@@ -3096,7 +3130,12 @@ class MiniMaxH3DiT(nn.Module):
         x = profiled_call(
             "dit.final_norm_adaln",
             "adaln_norm_residual",
-            lambda: self.final_layer.norm_out(x, temb, timestep_indices),
+            lambda: self.final_layer.norm_out(
+                x,
+                temb,
+                timestep_indices,
+                lora=(getattr(block_provider, "final_lora", None) if block_provider is not None else None),
+            ),
             metadata={"sequence_length": seq_len, "hidden_size": self.config.hidden_size},
         )
         video_out = profiled_call(

@@ -8,6 +8,7 @@ float32 cast the transformer applies; the scheduler is checked over a full denoi
 
 from __future__ import annotations
 
+import importlib.util
 import sys
 from pathlib import Path
 
@@ -18,11 +19,19 @@ import torch
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-from diffusers.modular_pipelines.minimax_h3 import packing as ref_packing
 from diffusers.schedulers.scheduling_minimax_h3 import MiniMaxH3Scheduler as RefScheduler
 
 from minimax_h3_mlx import packing as mine
 from minimax_h3_mlx.scheduler import MiniMaxH3Scheduler
+
+PACKING_REFERENCE = ROOT / "reference" / "diffusers" / "modular" / "packing.py"
+PACKING_MODULE = "diffusers.modular_pipelines.minimax_h3.packing"
+spec = importlib.util.spec_from_file_location(PACKING_MODULE, PACKING_REFERENCE)
+if spec is None or spec.loader is None:
+    raise ImportError(f"Cannot load vendored packing reference at {PACKING_REFERENCE}")
+ref_packing = importlib.util.module_from_spec(spec)
+sys.modules[PACKING_MODULE] = ref_packing
+spec.loader.exec_module(ref_packing)
 
 FAILURES: list[str] = []
 

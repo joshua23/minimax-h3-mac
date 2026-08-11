@@ -236,13 +236,13 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--turbo-lora",
         default=None,
-        help=f"MiniMax-H3 Turbo PEFT safetensors; may also be set with {TURBO_LORA_ENV_VAR}; use --steps 5 for 4 NFE",
+        help=f"MiniMax-H3 Turbo adapter file or native MLX adapter directory; may also be set with {TURBO_LORA_ENV_VAR}; use --steps 5 for 4 NFE",
     )
     parser.add_argument(
         "--turbo-lora-alpha",
         type=float,
-        default=8.0,
-        help="training alpha for --turbo-lora (published v0.1 uses 8)",
+        default=None,
+        help="legacy PEFT training alpha; omit for native MLX adapters, which record alpha=rank",
     )
     parser.add_argument("--turbo-lora-scale", type=float, default=1.0, help="runtime multiplier for --turbo-lora")
     parser.add_argument("--memory-limit-gb", type=float, default=16.0, help="MLX allocation guideline for --low-memory")
