@@ -297,40 +297,106 @@ ffmpeg -v error -i out/bf16-turbo-1344x768-5s.mp4 -f null -
 
 ---
 
-# 更省空间：使用校准 INT8 DiT
+# 更省空间、更快：Argus 校准 INT8 + 原生 MLX Turbo
 
-如果不想下载 62GiB BF16 DiT，可以改用 MLX INT8：
+除了上面的原始 BF16 路线，本仓库还完整支持并实测了以下组合：
+
+- **DiT**：[`water1234/MiniMax-H3-MLX-Argus-Calibrated-INT8`](https://huggingface.co/water1234/MiniMax-H3-MLX-Argus-Calibrated-INT8)；
+- **Turbo**：[`water1234/MiniMax-H3-Turbo-v4-step600-EMA-MLX`](https://huggingface.co/water1234/MiniMax-H3-Turbo-v4-step600-EMA-MLX)；
+- **Text Encoder**：截断到 H3 实际使用的前 50 层，并以 MLX 4-bit 逐层流式加载；
+- **VAE、tokenizer 与 processor**：来自 MiniMax-H3 官方 FL2VA 资产。
+
+这里的 Turbo 是我们已经转换、校验并发布的 **BF16 原生 MLX 流式目录**，不是运行时临时转换，也不会合并或重新量化进 INT8 DiT。它保留原始 Larry v4-step600 EMA 适配器的全部 518 个 BF16 tensor 和 259 对 LoRA，记录 `alpha=rank`，并拆分为 53 个按组件加载的 shard。
+
+## 1. 下载 Argus INT8 DiT 与原生 MLX Turbo
 
 ```bash
 hf download water1234/MiniMax-H3-MLX-Argus-Calibrated-INT8 \
+  --revision 70505b09c80e298e684d798d8e0f946937dcfad4 \
   --local-dir models/MiniMax-H3-MLX-Argus-Calibrated-INT8
+
+hf download water1234/MiniMax-H3-Turbo-v4-step600-EMA-MLX \
+  --revision 9771f9c606a50671bb94ee57191461602f02d1fc \
+  --local-dir models/MiniMax-H3-Turbo-v4-step600-EMA-MLX
 ```
 
-运行示例：
+需要 Hugging Face 中转站时，在命令前设置：
 
 ```bash
-.venv/bin/python scripts/generate.py \
-  "A fox running through a misty forest" \
-  --checkpoint models/MiniMax-H3/FL2VA \
-  --transformer models/MiniMax-H3-MLX-Argus-Calibrated-INT8 \
-  --low-memory \
-  --stream-blocks \
-  --resolution 320x192 \
-  --duration 5 \
-  --steps 21 \
-  --require-muxed-mp4 \
-  --output out/int8-output.mp4
+export HF_ENDPOINT=https://hf-mirror.com
 ```
 
-`--steps 21` 对应 20 次 denoiser evaluation。Text Encoder 默认仍使用上游 BF16 流式路径。
+INT8 DiT 使用 group-size 32 的 MLX affine INT8，共 254 个量化 Linear，另外 4 个敏感投影保留 BF16。模型有效文件约 37.8GB（十进制），不包含 Text Encoder 和 VAE。
 
----
+## 2. 构建低内存 MLX 4-bit Text Encoder
 
-# 可选：Larry Turbo LoRA 原值打包
+如果尚未转换 Text Encoder：
 
-Larry 原始 safetensors 中的 BF16 数组可以被 MLX 使用。以下工具会验证 key、shape、rank，记录 `alpha=rank`，并拆成可按组件流式加载的目录，不改变 tensor 数值：
+```bash
+python scripts/quantize_text_encoder.py \
+  --source models/MiniMax-H3/FL2VA/text_encoder \
+  --output models/MiniMax-H3-MLX-TextEncoder-4bit \
+  --bits 4 \
+  --group-size 64 \
+  --num-layers 50
+```
 
-下载：<https://huggingface.co/larryvrh/MiniMax-H3-Turbo-Lora>
+流式路径只解量化当前提示词实际使用的 embedding 行，然后逐层加载 50 个 Decoder Layer，不会展开整个量化词表或让完整 Text Encoder 常驻内存。
+
+## 3. INT8 + 原生 MLX Turbo 正式生成命令
+
+```bash
+mkdir -p out profiles
+
+caffeinate -dimsu .venv/bin/python scripts/generate.py \
+  "A luminous silver-white fox runs gracefully through an ancient enchanted autumn forest at blue hour, glowing fireflies spiral between moss-covered trees, golden leaves drift slowly through soft volumetric moonlight, cinematic low-angle tracking shot, shallow depth of field, exquisite detailed fur, magical realism, rich teal and amber color grading, smooth coherent natural motion, atmospheric and elegant, no text, no watermark" \
+  --checkpoint models/MiniMax-H3/FL2VA \
+  --transformer models/MiniMax-H3-MLX-Argus-Calibrated-INT8 \
+  --text-encoder models/MiniMax-H3-MLX-TextEncoder-4bit \
+  --turbo-lora models/MiniMax-H3-Turbo-v4-step600-EMA-MLX \
+  --turbo-lora-scale 1.0 \
+  --profile quality \
+  --low-memory \
+  --stream-blocks \
+  --resolution 768x448 \
+  --duration 5 \
+  --steps 9 \
+  --seed 42 \
+  --memory-pressure-guard \
+  --no-block-cache \
+  --dense-dequant-profile off \
+  --require-muxed-mp4 \
+  --forward-profile-json profiles/int8-turbo-768x448-5s.json \
+  --output out/int8-turbo-768x448-5s.mp4
+```
+
+`--steps 9` 对应 8 次 DiT forward。原生 MLX Turbo 已记录每个组件的 rank/alpha，因此**不要传** `--turbo-lora-alpha`；运行时保持 BF16 LoRA 更新与 INT8 基座分离。
+
+## 4. 24GB M4 Pro 实测结果
+
+上述命令已在同一台 24GB M4 Pro MacBook Pro 上端到端跑通：
+
+| 项目 | 实测结果 |
+|---|---:|
+| 分辨率与帧数 | 768×448，124 帧，24 FPS |
+| 音视频时长 | 视频 5.1667 秒；立体声音频 5.152 秒 |
+| Text Encoder | 23.4 秒 |
+| AdaLN cache | 3.4 秒 |
+| DiT | 8 NFE，平均 154.3 秒/NFE |
+| **端到端总耗时** | **1,378.0 秒（约 23 分钟）** |
+| 最大 RSS | **约 12.0GB** |
+| 输出格式 | H.264 + 32kHz stereo AAC |
+
+- **[点击观看或下载 INT8 + MLX Turbo 生成视频](examples/int8-turbo-768x448/output-int8-turbo-768x448-5s.mp4)**
+- [查看六帧预览图](examples/int8-turbo-768x448/contact-sheet.jpg)
+- [提示词文件](examples/int8-turbo-768x448/prompt.txt)
+- 视频 SHA256：`9912a4f1ed3e8b909cb63ad216a38dfd96a5230ab73c21273a0579f450043037`
+
+输出已经通过 ffmpeg 完整音视频解码检查；AAC 为 32kHz 双声道且有效非静音。该 INT8 是经过激活校准的质量候选，但量化本身不是数学无损。
+
+## 5. 可复现的 Turbo 转换工具
+
+通常直接下载上面的 `water1234/MiniMax-H3-Turbo-v4-step600-EMA-MLX` 即可。如果需要从 Larry 原始发布重新验证和打包：
 
 ```bash
 python scripts/convert_turbo_lora_to_mlx.py \
@@ -341,7 +407,7 @@ python scripts/convert_turbo_lora_to_mlx.py \
   --source-revision 43a74557ac3f6539db8e0f2a959d03feb7a81480
 ```
 
-工具会保留全部 518 个 BF16 tensor、验证 259 对 LoRA，并生成 53 个组件 shard。
+转换只改变 MLX 的打包和索引布局，不改变 BF16 tensor 数值。
 
 ---
 
@@ -350,8 +416,9 @@ python scripts/convert_turbo_lora_to_mlx.py \
 - 本项目：<https://github.com/Argus-AiTeam/minimax-h3-mac>
 - MiniMax-H3 官方权重：<https://huggingface.co/MiniMaxAI/MiniMax-H3>
 - Argus 校准 MLX INT8 DiT：<https://huggingface.co/water1234/MiniMax-H3-MLX-Argus-Calibrated-INT8>
+- Argus 原生 MLX BF16 Turbo：<https://huggingface.co/water1234/MiniMax-H3-Turbo-v4-step600-EMA-MLX>
 - LightX2V Turbo v1.0 768p：<https://huggingface.co/lightx2v/Minimax-h3-Turbo>
-- Larry Turbo LoRA：<https://huggingface.co/larryvrh/MiniMax-H3-Turbo-Lora>
+- Larry Turbo LoRA 原始发布：<https://huggingface.co/larryvrh/MiniMax-H3-Turbo-Lora>
 
 ---
 

@@ -295,40 +295,106 @@ Actual runtime varies with prompt length, chip model, thermals, storage, and bac
 
 ---
 
-# Smaller alternative: calibrated INT8 DiT
+# Smaller and faster: Argus calibrated INT8 + native MLX Turbo
 
-If you do not want to download the 62 GiB BF16 DiT, download the calibrated MLX INT8 model:
+In addition to the original BF16 route above, this repository supports and has measured the following complete configuration:
+
+- **DiT:** [`water1234/MiniMax-H3-MLX-Argus-Calibrated-INT8`](https://huggingface.co/water1234/MiniMax-H3-MLX-Argus-Calibrated-INT8);
+- **Turbo:** [`water1234/MiniMax-H3-Turbo-v4-step600-EMA-MLX`](https://huggingface.co/water1234/MiniMax-H3-Turbo-v4-step600-EMA-MLX);
+- **Text encoder:** truncated to the 50 layers actually consumed by H3 and streamed layer by layer in MLX 4-bit;
+- **VAEs, tokenizer, and processor:** the official MiniMax-H3 FL2VA assets.
+
+The Turbo repository is our published **native BF16 MLX streaming directory**, not an on-the-fly conversion. It is neither merged into nor requantized with the INT8 DiT. It preserves all 518 BF16 tensors and 259 LoRA pairs from the Larry v4-step600 EMA adapter, records `alpha=rank`, and splits the weights into 53 component-level shards.
+
+## 1. Download the Argus INT8 DiT and native MLX Turbo
 
 ```bash
 hf download water1234/MiniMax-H3-MLX-Argus-Calibrated-INT8 \
+  --revision 70505b09c80e298e684d798d8e0f946937dcfad4 \
   --local-dir models/MiniMax-H3-MLX-Argus-Calibrated-INT8
+
+hf download water1234/MiniMax-H3-Turbo-v4-step600-EMA-MLX \
+  --revision 9771f9c606a50671bb94ee57191461602f02d1fc \
+  --local-dir models/MiniMax-H3-Turbo-v4-step600-EMA-MLX
 ```
 
-Example:
+To use a Hugging Face mirror, set it before downloading:
 
 ```bash
-.venv/bin/python scripts/generate.py \
-  "A fox running through a misty forest" \
-  --checkpoint models/MiniMax-H3/FL2VA \
-  --transformer models/MiniMax-H3-MLX-Argus-Calibrated-INT8 \
-  --low-memory \
-  --stream-blocks \
-  --resolution 320x192 \
-  --duration 5 \
-  --steps 21 \
-  --require-muxed-mp4 \
-  --output out/int8-output.mp4
+export HF_ENDPOINT=https://hf-mirror.com
 ```
 
-`--steps 21` corresponds to 20 denoiser evaluations. The text encoder still defaults to the upstream BF16 streamed path.
+The DiT uses group-size-32 MLX affine INT8 for 254 linear layers while retaining four sensitivity-selected projections in BF16. Its effective files occupy approximately 37.8 GB in decimal units and do not include the text encoder or VAEs.
 
----
+## 2. Build the low-memory MLX 4-bit text encoder
 
-# Optional: package the original Larry Turbo LoRA
+If the text encoder has not been converted yet:
 
-The original Larry safetensors contains BF16 arrays that MLX can use. This tool validates keys, shapes, and ranks, records `alpha=rank`, and splits the adapter into streamable component files without changing tensor values.
+```bash
+python scripts/quantize_text_encoder.py \
+  --source models/MiniMax-H3/FL2VA/text_encoder \
+  --output models/MiniMax-H3-MLX-TextEncoder-4bit \
+  --bits 4 \
+  --group-size 64 \
+  --num-layers 50
+```
 
-Download: <https://huggingface.co/larryvrh/MiniMax-H3-Turbo-Lora>
+The streaming route dequantizes only the embedding rows needed by the prompt and then loads the 50 decoder layers one at a time. It never expands the complete quantized vocabulary table or keeps the complete text encoder resident.
+
+## 3. Production INT8 + native MLX Turbo command
+
+```bash
+mkdir -p out profiles
+
+caffeinate -dimsu .venv/bin/python scripts/generate.py \
+  "A luminous silver-white fox runs gracefully through an ancient enchanted autumn forest at blue hour, glowing fireflies spiral between moss-covered trees, golden leaves drift slowly through soft volumetric moonlight, cinematic low-angle tracking shot, shallow depth of field, exquisite detailed fur, magical realism, rich teal and amber color grading, smooth coherent natural motion, atmospheric and elegant, no text, no watermark" \
+  --checkpoint models/MiniMax-H3/FL2VA \
+  --transformer models/MiniMax-H3-MLX-Argus-Calibrated-INT8 \
+  --text-encoder models/MiniMax-H3-MLX-TextEncoder-4bit \
+  --turbo-lora models/MiniMax-H3-Turbo-v4-step600-EMA-MLX \
+  --turbo-lora-scale 1.0 \
+  --profile quality \
+  --low-memory \
+  --stream-blocks \
+  --resolution 768x448 \
+  --duration 5 \
+  --steps 9 \
+  --seed 42 \
+  --memory-pressure-guard \
+  --no-block-cache \
+  --dense-dequant-profile off \
+  --require-muxed-mp4 \
+  --forward-profile-json profiles/int8-turbo-768x448-5s.json \
+  --output out/int8-turbo-768x448-5s.mp4
+```
+
+`--steps 9` produces eight DiT forwards. The native MLX adapter records each component's rank and alpha, so **do not pass** `--turbo-lora-alpha`; the runtime keeps the BF16 LoRA update separate from the INT8 base.
+
+## 4. Measured result on the 24 GB M4 Pro
+
+The command above completed end to end on the same 24 GB M4 Pro MacBook Pro:
+
+| Item | Measured result |
+|---|---:|
+| Resolution and frames | 768×448, 124 frames, 24 FPS |
+| Media duration | 5.1667 s video; 5.152 s stereo audio |
+| Text encoder | 23.4 s |
+| AdaLN cache | 3.4 s |
+| DiT | 8 NFE, mean 154.3 s/NFE |
+| **End-to-end** | **1,378.0 s (approximately 23 minutes)** |
+| Maximum RSS | **approximately 12.0 GB** |
+| Output | H.264 + 32 kHz stereo AAC |
+
+- **[Watch or download the INT8 + MLX Turbo result](examples/int8-turbo-768x448/output-int8-turbo-768x448-5s.mp4)**
+- [View the six-frame contact sheet](examples/int8-turbo-768x448/contact-sheet.jpg)
+- [Prompt text file](examples/int8-turbo-768x448/prompt.txt)
+- Video SHA256: `9912a4f1ed3e8b909cb63ad216a38dfd96a5230ab73c21273a0579f450043037`
+
+The output passed a complete ffmpeg video/audio decode. Its AAC stream is active, non-silent, 32 kHz stereo. This calibrated INT8 release is a measured quality candidate, not a claim of mathematically lossless quantization.
+
+## 5. Reproducible Turbo conversion tool
+
+Normally, download `water1234/MiniMax-H3-Turbo-v4-step600-EMA-MLX` directly. To revalidate and package the original Larry release yourself:
 
 ```bash
 python scripts/convert_turbo_lora_to_mlx.py \
@@ -339,7 +405,7 @@ python scripts/convert_turbo_lora_to_mlx.py \
   --source-revision 43a74557ac3f6539db8e0f2a959d03feb7a81480
 ```
 
-The packager preserves all 518 BF16 tensors, validates 259 LoRA pairs, and writes 53 component shards.
+Conversion changes only the MLX packaging and index layout; it does not change the BF16 tensor values.
 
 ---
 
@@ -348,8 +414,9 @@ The packager preserves all 518 BF16 tensors, validates 259 LoRA pairs, and write
 - This project: <https://github.com/Argus-AiTeam/minimax-h3-mac>
 - Upstream MiniMax-H3: <https://huggingface.co/MiniMaxAI/MiniMax-H3>
 - Argus calibrated MLX INT8 DiT: <https://huggingface.co/water1234/MiniMax-H3-MLX-Argus-Calibrated-INT8>
+- Argus native MLX BF16 Turbo: <https://huggingface.co/water1234/MiniMax-H3-Turbo-v4-step600-EMA-MLX>
 - LightX2V Turbo v1.0 768p: <https://huggingface.co/lightx2v/Minimax-h3-Turbo>
-- Larry Turbo LoRA: <https://huggingface.co/larryvrh/MiniMax-H3-Turbo-Lora>
+- Original Larry Turbo LoRA release: <https://huggingface.co/larryvrh/MiniMax-H3-Turbo-Lora>
 
 ---
 
