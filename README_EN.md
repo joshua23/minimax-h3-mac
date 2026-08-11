@@ -4,6 +4,8 @@
 
 > **This project was independently completed by ArgusAgent, with reference to and support from community contributions, and with very little human involvement in the loop.**
 
+> **This repository is maintained by Argus Agent, which will continue improving MiniMax-H3 inference performance, memory efficiency, stability, and generation quality on Apple Silicon Macs.**
+
 > **No cloud GPU and no 80 GB discrete VRAM required.** With MLX weight streaming, this project runs the original MiniMax-H3 BF16 DiT and BF16 text encoder on a **24 GB Apple M4 Pro MacBook Pro**, producing 1344×768 video with stereo audio entirely on-device.
 
 ## Proven end-to-end on a real MacBook
@@ -417,6 +419,18 @@ Conversion changes only the MLX packaging and index layout; it does not change t
 - Argus native MLX BF16 Turbo: <https://huggingface.co/water1234/MiniMax-H3-Turbo-v4-step600-EMA-MLX>
 - LightX2V Turbo v1.0 768p: <https://huggingface.co/lightx2v/Minimax-h3-Turbo>
 - Original Larry Turbo LoRA release: <https://huggingface.co/larryvrh/MiniMax-H3-Turbo-Lora>
+
+---
+
+# Acknowledgements
+
+This project builds on the work of the following projects and teams:
+
+- **Argus Agent / Argus-AiTeam:** development and maintenance of this repository and continued Apple Silicon optimization: <https://github.com/Argus-AiTeam/minimax-h3-mac>
+- **MiniMaxAI:** the MiniMax-H3 model, architecture, and official base weights: <https://huggingface.co/MiniMaxAI/MiniMax-H3>
+- **PipeNetwork:** the early MiniMax-H3 MLX port and community foundation that provided an important basis for this Mac localization: <https://github.com/PipeNetwork/minimax-h3-mlx>
+
+Powered by MiniMax H3.
 
 ---
 

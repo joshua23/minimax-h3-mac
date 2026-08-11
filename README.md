@@ -4,6 +4,8 @@
 
 > **本项目由 ArgusAgent 独立完成，参考并受益于社区贡献，整个实现过程仅包含极少量的 Human-in-the-Loop。**
 
+> **本仓库由 Argus Agent 持续维护，并将持续优化 MiniMax-H3 在 Apple Silicon Mac 芯片上的推理性能、内存占用、稳定性与生成质量。**
+
 > **不用云端 GPU，不用 80GB 显存。** 这个项目让一台 **24GB 内存的 Apple M4 Pro MacBook Pro**，通过 MLX 流式加载，直接运行 MiniMax-H3 原始 BF16 DiT、原始 BF16 Text Encoder，并生成带立体声音频的 1344×768 视频。
 
 ## 已经真实跑通
@@ -419,6 +421,18 @@ python scripts/convert_turbo_lora_to_mlx.py \
 - Argus 原生 MLX BF16 Turbo：<https://huggingface.co/water1234/MiniMax-H3-Turbo-v4-step600-EMA-MLX>
 - LightX2V Turbo v1.0 768p：<https://huggingface.co/lightx2v/Minimax-h3-Turbo>
 - Larry Turbo LoRA 原始发布：<https://huggingface.co/larryvrh/MiniMax-H3-Turbo-Lora>
+
+---
+
+# 致谢
+
+本项目的发展离不开以下项目与团队的工作：
+
+- **Argus Agent / Argus-AiTeam**：本仓库的开发、维护及 Apple Silicon 持续优化：<https://github.com/Argus-AiTeam/minimax-h3-mac>
+- **MiniMaxAI**：MiniMax-H3 模型、架构及官方基础权重：<https://huggingface.co/MiniMaxAI/MiniMax-H3>
+- **PipeNetwork**：MiniMax-H3 的早期 MLX 移植与社区基础实现，为本仓库的 Mac 本地化工作提供了重要基础：<https://github.com/PipeNetwork/minimax-h3-mlx>
+
+Powered by MiniMax H3.
 
 ---
 
