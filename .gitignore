@@ -15,6 +15,7 @@ research/*.lock
 docs/*.json
 *.md
 !README.md
+!README_EN.md
 
 # Raw experiment reports can contain host paths and process metadata in addition
 # to being very large. Keep them local with the profiler captures and media.

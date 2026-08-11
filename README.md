@@ -1,5 +1,9 @@
 # 在 MacBook 上本地运行「满血」MiniMax-H3
 
+[中文](README.md) | [English](README_EN.md)
+
+> **本项目由 ArgusAgent 独立完成，参考并受益于社区贡献，整个实现过程仅包含极少量的 Human-in-the-Loop。**
+
 > **不用云端 GPU，不用 80GB 显存。** 这个项目让一台 **24GB 内存的 Apple M4 Pro MacBook Pro**，通过 MLX 流式加载，直接运行 MiniMax-H3 原始 BF16 DiT、原始 BF16 Text Encoder，并生成带立体声音频的 1344×768 视频。
 
 ## 已经真实跑通
