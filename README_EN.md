@@ -2,9 +2,11 @@
 
 [中文](README.md) | [English](README_EN.md)
 
-> **This project was independently completed by ArgusAgent, with reference to and support from community contributions, and with very little human involvement in the loop.**
+> **Most of the code adaptation, experiment execution, performance validation, and documentation in this repository were completed autonomously by [Argus](https://github.com/lbx154/Argus), building on community contributions with very little human involvement in the loop.**
 
-> **This repository is maintained by Argus Agent, which will continue improving MiniMax-H3 inference performance, memory efficiency, stability, and generation quality on Apple Silicon Macs.**
+> **We strongly encourage everyone to try [Argus](https://github.com/lbx154/Argus): let the agent read the codebase, modify the project, run long experiments, analyze results, and iterate continuously. Stars, trials, and contributions are welcome.**
+
+> **This repository is continuously maintained by Argus Agent / Argus-AiTeam, with ongoing work on MiniMax-H3 inference speed, memory efficiency, stability, and generation quality on Apple Silicon Macs.**
 
 > **No cloud GPU and no 80 GB discrete VRAM required.** With MLX weight streaming, this project runs the original MiniMax-H3 BF16 DiT and BF16 text encoder on a **24 GB Apple M4 Pro MacBook Pro**, producing 1344×768 video with stereo audio entirely on-device.
 
@@ -420,6 +422,7 @@ Conversion changes only the MLX packaging and index layout; it does not change t
 
 # Project and model links
 
+- Argus Agent: <https://github.com/lbx154/Argus>
 - This project: <https://github.com/Argus-AiTeam/minimax-h3-mac>
 - Upstream MiniMax-H3: <https://huggingface.co/MiniMaxAI/MiniMax-H3>
 - Argus calibrated MLX INT8 DiT: <https://huggingface.co/water1234/MiniMax-H3-MLX-Argus-Calibrated-INT8>
@@ -433,7 +436,8 @@ Conversion changes only the MLX packaging and index layout; it does not change t
 
 This project builds on the work of the following projects and teams:
 
-- **Argus Agent / Argus-AiTeam:** development and maintenance of this repository and continued Apple Silicon optimization: <https://github.com/Argus-AiTeam/minimax-h3-mac>
+- **Argus:** autonomously completed most of the code adaptation, experiments, validation, and documentation in this repository: <https://github.com/lbx154/Argus>
+- **Argus-AiTeam:** repository maintenance and continued Apple Silicon optimization: <https://github.com/Argus-AiTeam/minimax-h3-mac>
 - **MiniMaxAI:** the MiniMax-H3 model, architecture, and official base weights: <https://huggingface.co/MiniMaxAI/MiniMax-H3>
 - **PipeNetwork:** the early MiniMax-H3 MLX port and community foundation that provided an important basis for this Mac localization: <https://github.com/PipeNetwork/minimax-h3-mlx>
 
