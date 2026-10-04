@@ -21,3 +21,5 @@ docs/*.json
 # to being very large. Keep them local with the profiler captures and media.
 experiments/**
 !experiments/**/
+
+.DS_Store

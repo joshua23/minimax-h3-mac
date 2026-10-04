@@ -249,6 +249,154 @@ def _temporal_position_span(num_latent_frames: int) -> float:
     return float(spans.sum())
 
 
+def _temporal_position_span_sequential(num_latent_frames: int) -> float:
+    """The same span summed **sequentially** in float64.
+
+    The ``ref2va`` builder sums the series per reference video with a Python ``sum``, which differs
+    from the pairwise NumPy sum of :func:`_temporal_position_span` in the last ulp from 16 latent
+    frames onwards — the reference implementation keeps both, one per call site.
+    """
+    return sum(
+        _ROPE_FRAME_RESCALE * _ROPE_FRAMES_PER_LATENT[index % len(_ROPE_FRAMES_PER_LATENT)]
+        for index in range(num_latent_frames)
+    )
+
+
+def _frame_position_grid(
+    latent_height: int, latent_width: int, patch_h: int, patch_w: int
+) -> tuple[np.ndarray, np.ndarray]:
+    """The ``(h, w)`` rotary coordinates of one latent frame, and the width axis they were built from."""
+    sqrt_area = np.sqrt(latent_height * latent_width)
+    height_grid = _spatial_position_grid(latent_height, patch_h, sqrt_area)
+    width_grid = _spatial_position_grid(latent_width, patch_w, sqrt_area)
+    hh, ww = np.meshgrid(height_grid, width_grid, indexing="ij")
+    return np.stack([hh.reshape(-1), ww.reshape(-1)], axis=-1), width_grid
+
+
+def _fill_audio_positions(
+    position_ids: np.ndarray,
+    rows: slice,
+    num_audio_latents: int,
+    rotary_time: float,
+    width_grid: np.ndarray,
+) -> None:
+    """Place one channel-major audio block, pinned to the width extremes of its own block's grid."""
+    time = rotary_time + np.arange(num_audio_latents, dtype=np.float64)
+    position_ids[rows, 0] = np.tile(time, AUDIO_CHANNELS)
+    position_ids[rows, 2] = np.concatenate(
+        [
+            np.full(num_audio_latents, float(width_grid[0]), dtype=np.float64),
+            np.full(num_audio_latents, float(width_grid[-1]), dtype=np.float64),
+        ]
+    )
+
+
+def build_ref2va_packed_sequence(
+    text_token_tags: np.ndarray | list[int],
+    references: list,
+    num_latent_frames: int,
+    latent_height: int,
+    latent_width: int,
+    num_audio_latents: int,
+    patch_size: tuple[int, int, int],
+) -> PackedSequence:
+    """Build the ``[text | reference blocks | target audio | target video]`` layout of ``ref2va``.
+
+    Args:
+        text_token_tags: modality tag of every text row (``1``, except the rows of a reference's
+            vision block, which MiniMax-H3 tags ``0`` — the presentation builder already does this).
+        references: the prepared references, in packed order, with their latent geometry resolved.
+            Anything carrying ``kind`` / ``has_audio`` / ``num_video_rows`` / ``num_audio_rows`` /
+            ``num_audio_latents`` / ``num_latent_frames`` / ``latent_height`` / ``latent_width``
+            works — :class:`ref2va.PreparedReference` is the concrete shape.
+    """
+    _, ph, pw = patch_size
+    text_tags = np.asarray(text_token_tags, dtype=np.int64)
+    num_text = int(text_tags.shape[0])
+    num_target_video_rows = num_latent_frames * (latent_height // ph) * (latent_width // pw)
+    num_target_audio_rows = num_audio_latents * AUDIO_CHANNELS
+    num_reference_video_rows = sum(reference.num_video_rows for reference in references if reference.kind != "audio")
+    num_reference_audio_rows = sum(reference.num_audio_rows for reference in references)
+    seq_len = num_text + num_reference_video_rows + num_reference_audio_rows + num_target_audio_rows + num_target_video_rows
+
+    position_ids = np.zeros((seq_len, 3), dtype=np.float64)
+    position_ids[:num_text, 0] = np.arange(num_text, dtype=np.float64)
+    target_frame_grid, target_width_grid = _frame_position_grid(latent_height, latent_width, ph, pw)
+
+    # Reference blocks, in request order. `rotary_time` is the shared audio/video clock: it starts
+    # where the text rows end and every block pushes it forward by the time that block occupies.
+    video_indices: list[np.ndarray] = []
+    audio_indices: list[np.ndarray] = []
+    cursor = num_text
+    rotary_time = float(num_text)
+    for reference in references:
+        if reference.kind == "image":
+            rows = slice(cursor, cursor + reference.num_video_rows)
+            cursor = rows.stop
+            video_indices.append(np.arange(rows.start, rows.stop))
+            frame_grid, _ = _frame_position_grid(reference.latent_height, reference.latent_width, ph, pw)
+            position_ids[rows, 0] = rotary_time
+            position_ids[rows, 1:] = frame_grid
+            # An image is a single frame and takes a single integer rotary slot, not a latent
+            # frame's 5/3 units.
+            rotary_time += 1.0
+        elif reference.kind == "audio":
+            rows = slice(cursor, cursor + reference.num_audio_rows)
+            cursor = rows.stop
+            audio_indices.append(np.arange(rows.start, rows.stop))
+            _fill_audio_positions(position_ids, rows, reference.num_audio_latents, rotary_time, target_width_grid)
+            rotary_time += float(reference.num_audio_latents)
+        elif reference.kind == "video":
+            # A video reference's soundtrack rows are packed immediately before its video rows and
+            # share their origin, so the two are rotary-aligned exactly as the generated audio and
+            # video are.
+            audio_rows = slice(cursor, cursor + reference.num_audio_rows)
+            video_rows = slice(audio_rows.stop, audio_rows.stop + reference.num_video_rows)
+            cursor = video_rows.stop
+            audio_indices.append(np.arange(audio_rows.start, audio_rows.stop))
+            video_indices.append(np.arange(video_rows.start, video_rows.stop))
+
+            frame_grid, width_grid = _frame_position_grid(reference.latent_height, reference.latent_width, ph, pw)
+            _fill_audio_positions(position_ids, audio_rows, reference.num_audio_latents, rotary_time, width_grid)
+            frame_time = _temporal_position_grid(reference.num_latent_frames, rotary_time)
+            position_ids[video_rows, 0] = np.repeat(frame_time, frame_grid.shape[0])
+            position_ids[video_rows, 1:] = np.tile(frame_grid, (reference.num_latent_frames, 1))
+            rotary_time += max(
+                float(reference.num_audio_latents), _temporal_position_span_sequential(reference.num_latent_frames)
+            )
+        else:
+            raise ValueError(f"A reference must be an 'image', a 'video' or an 'audio', got {reference.kind!r}.")
+
+    # The generated rows. Target audio and target video share the origin the reference blocks left
+    # behind.
+    audio_start = cursor
+    video_start = audio_start + num_target_audio_rows
+    _fill_audio_positions(position_ids, slice(audio_start, video_start), num_audio_latents, rotary_time, target_width_grid)
+    frame_time = _temporal_position_grid(num_latent_frames, rotary_time)
+    position_ids[video_start:, 0] = np.repeat(frame_time, target_frame_grid.shape[0])
+    position_ids[video_start:, 1:] = np.tile(target_frame_grid, (num_latent_frames, 1))
+
+    video_idx = np.concatenate(video_indices + [np.arange(video_start, seq_len)])
+    audio_idx = np.concatenate(audio_indices + [np.arange(audio_start, video_start)])
+    text_idx = np.arange(num_text)
+
+    tags = np.empty(seq_len, dtype=np.int64)
+    tags[text_idx] = text_tags
+    tags[audio_idx] = TAG_AUDIO
+    tags[video_idx] = TAG_VIDEO
+
+    return PackedSequence(
+        sequence_length=seq_len,
+        position_ids=mx.array(position_ids.astype(np.float32)),
+        token_tags=mx.array(tags.astype(np.int32)),
+        video_indices=mx.array(video_idx.astype(np.int32)),
+        audio_indices=mx.array(audio_idx.astype(np.int32)),
+        text_indices=mx.array(text_idx.astype(np.int32)),
+        num_condition_video_rows=int(num_reference_video_rows),
+        num_condition_audio_rows=int(num_reference_audio_rows),
+    )
+
+
 def build_packed_sequence(
     text_token_tags: np.ndarray | list[int],
     num_latent_frames: int,

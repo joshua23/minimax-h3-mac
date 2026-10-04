@@ -266,6 +266,75 @@ ffmpeg -v error -i out/bf16-turbo-1344x768-5s.mp4 -f null -
 
 没有输出错误即表示视频和音频可以完整解码。
 
+## 8. 图生视频（首帧 / 尾帧锚定）
+
+在任意生成命令上加 `--image`（可重复）与 `--anchor first|last`（与 `--image` 一一对应）即可进行图生视频：
+
+```bash
+caffeinate -dimsu .venv/bin/python scripts/generate.py \
+  "The scene continues from this frame with smooth cinematic motion, coherent lighting" \
+  --checkpoint models/MiniMax-H3/FL2VA \
+  --transformer models/MiniMax-H3/FL2VA/transformer \
+  --turbo-lora models/Minimax-h3-Turbo-v1.0-4step-768p-bf16/minimax_h3_fl2v_turbo_4step_v1.0_768p_bf16.safetensors \
+  --sigma-shift-video 6 --sigma-shift-audio 3 \
+  --steps 5 --low-memory --stream-blocks --no-block-cache --memory-limit-gb 24 \
+  --image path/to/first-frame.jpg --anchor first \
+  --resolution 1344x768 --duration 5 \
+  --output out/i2v-1344x768-5s.mp4
+```
+
+- `--anchor first`：给定图作为生成视频的第一帧；`--anchor last`：作为最后一帧。可以只用一张，也可以首尾各一张。
+- 锚定帧并不是位级拷贝：参考实现把锚定帧加噪到 t = 0.999 并在每一步保持，所以首帧与输入图高度一致但不逐像素相同。
+- 低内存路线的图像支持方式：Qwen3-VL 视觉塔（约 1.2GB BF16）在一次编码期间临时驻留，产出视觉条件行后立即释放；关键帧 VAE 编码安排在流式 DiT 加载之前，video VAE 与 DiT 不同时驻留。
+- 实测（M4 Pro 24GB）：2585×1454 真实图片的条件编码峰值内存约 3.2GiB；512×288 / 5 秒 / 4 NFE 端到端约 8 分钟，生成首帧与输入图像素相关系数 0.989。
+- 纯文本请求不受影响：不传 `--image` 时视觉塔完全不加载。
+
+校验脚本与测试：
+
+```bash
+./.venv/bin/python tests/test_text_encoder_stream_vision.py      # 流式 vs 常驻编码位级奇偶
+./.venv/bin/python scripts/verify_streamed_vision_encode.py      # 真实权重关键帧编码与内存峰值
+```
+
+## 9. 参考生视频（Ref2VA 多参考，实验中）
+
+Ref2VA 是官方的另一份 DiT 权重（约 66.3GB），支持把最多 9 张图片、3 段视频、3 段音频作为"参考"参与生成——参考不绑定输出几何（不同于首帧锚定），模型按 `"<Picture i>" / "<Video k>" / "<Audio j>"` 标签理解它们。除 transformer 外的所有组件与 FL2VA 共用：
+
+```bash
+HF_HOME=models/.hf-home ./.venv/bin/python -c "
+from huggingface_hub import snapshot_download
+snapshot_download('MiniMaxAI/MiniMax-H3', allow_patterns=['Ref2VA/transformer/**', 'Ref2VA/model_index.json'], local_dir='models/MiniMax-H3', max_workers=4)
+"
+```
+
+MLX 多参考打包、视觉条件、参考 VAE 编码及 CLI 已接入。`--reference KIND:PATH` 可重复传入，顺序决定提示词中的编号；视频自带音轨会一同参与条件编码。24GB 低内存路径在条件编码阶段只驻留 VAE 编码器，视频逐 17 帧归一化并编码，避免加载约 9GiB 的闲置解码器。所有参考合计最多 12 个，纯音频参考须配至少一张图或一段视频。
+
+```bash
+./.venv/bin/python -m minimax_h3_mlx.generate_cli \
+  'The woman in <Picture 1> and the man in <Picture 2> stand together in a warmly lit room.' \
+  --checkpoint models/MiniMax-H3/FL2VA \
+  --transformer models/MiniMax-H3/Ref2VA/transformer \
+  --reference image:woman.jpg --reference image:man.jpg \
+  --profile quality --steps 16 --duration 5 --resolution 512x288 \
+  --output out/ref2va-preview.mp4
+```
+
+这里用 FL2VA 目录提供共享组件，用 Ref2VA transformer 生成。不要混用 `--image/--anchor` 和 `--reference`。上例 16 个 sigma 点对应 15 次去噪；FL2VA 的 Turbo LoRA 尚未验证兼容 Ref2VA，不用于本次效果验证。512×288 仅用于低分辨率探索，低于官方 768 短边发布几何。
+
+### Ref2VA 本机实测（M4 Pro 24GB）
+
+双图参考效果验证（证据见 `out/ref2va-validation/`）：从同一场景裁出女性与男性各一张参考图，提示词用 `<Picture 1>` / `<Picture 2>` 引用，512×288 / 5 秒 / 15 次去噪：
+
+| 阶段 | 实测 |
+|---|---|
+| 文本条件编码（两张图 + 提示词，8,296 行） | 98 秒，峰值 3.32GiB，视觉塔用后即释 |
+| 视频参考条件编码（124 帧 768p + 自带音轨） | 12.7 分钟，峰值 14.88GiB |
+| 15 次去噪 + 解码 | 88.8 分钟（约 337 秒/次前向） |
+
+效果（`effect-contact-sheet.jpg` 与 `two-subjects.mp4`）：两位人物的服装、发型与随身物件（男性腕表与皮包）全程保持；按提示词完成"男性转向门口再回望女性"的动作编排；场景几何与光照连贯。
+
+24GB 内存上的三条关键实践：条件编码阶段只加载 VAE 编码器（省约 9GiB 闲置解码器）；参考视频逐 17 帧块归一化并编码，避免整段像素常驻；视觉塔产出条件行后立即释放。
+
 ---
 
 # 24GB M4 Pro 实测性能

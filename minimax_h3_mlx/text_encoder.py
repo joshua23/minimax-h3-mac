@@ -33,6 +33,54 @@ from .config import TAG_TEXT, TAG_VIDEO
 from .packing import TEXT_ENCODER_LAYER
 
 
+def _deepstack_process(hidden_states: mx.array, visual_pos_masks: mx.array, visual_embeds: mx.array) -> mx.array:
+    """Add one deepstack visual embed level at the vision-token rows of ``hidden_states``.
+
+    Mirrors mlx_vlm's ``Qwen3VLModel._deepstack_process`` (which reads no instance state): the
+    streamed loop cannot call it through ``self.language`` because that module is never built.
+    """
+    batch_size = hidden_states.shape[0]
+    updated_batches = []
+    offset = 0
+    for b in range(batch_size):
+        batch_mask = visual_pos_masks[b]
+        batch_hidden = hidden_states[b]
+        batch_indices = mx.array(np.where(batch_mask)[0], dtype=mx.uint32)
+        n_visual = len(batch_indices)
+        if n_visual == 0:
+            updated_batches.append(batch_hidden)
+            continue
+        sample_embeds = visual_embeds[offset : offset + n_visual]
+        offset += n_visual
+        if sample_embeds.shape[0] != n_visual:
+            updated_batches.append(batch_hidden)
+            continue
+        batch_result = mx.array(batch_hidden)  # avoid modifying in-place
+        batch_result = batch_result.at[batch_indices].add(sample_embeds)
+        updated_batches.append(batch_result)
+    return mx.stack(updated_batches, axis=0)
+
+
+def _splice_vision_rows(inputs_embeds: mx.array, image_mask: mx.array, hidden: mx.array) -> mx.array:
+    """Replace the embedding rows at image-token positions with the vision tower's rows.
+
+    Follows mlx_vlm's ``masked_scatter``: a plain ``mx.where`` cannot broadcast the (L,) token mask
+    against the (num_image_tokens, D) update rows, and this masked scatter is exactly what the
+    torch reference's ``inputs_embeds[image_mask] = hidden`` computes.
+    """
+    n_mask = int(mx.sum(image_mask))
+    if n_mask != hidden.shape[0]:
+        raise ValueError(
+            f"Image features and image tokens do not match: tokens {n_mask}, features {hidden.shape[0]}"
+        )
+    shape = inputs_embeds.shape
+    flat = mx.flatten(inputs_embeds)
+    mask_flat = mx.flatten(mx.broadcast_to(image_mask[..., None], shape))
+    positions = mx.array(np.where(mask_flat)[0], mx.uint32)
+    flat[positions] = mx.flatten(hidden)
+    return mx.reshape(flat, shape)
+
+
 class MiniMaxH3TextEncoder:
     """Qwen3-VL-32B truncated to the layers MiniMax-H3 actually conditions on."""
 
@@ -64,9 +112,10 @@ class MiniMaxH3TextEncoder:
                 "layers is post-norm and is not the conditioning MiniMax-H3 expects."
             )
 
-        if stream_layers and load_vision:
-            raise ValueError("streamed text-encoder loading currently supports text-only requests")
-
+        # Streamed mode supports images: the BF16 vision tower (~1.2 GB) streams in for the one
+        # encode call, its outputs are materialized, and it is released before any decoder layer
+        # becomes resident — so peak residency is the tower *or* the embedding table + layer slot,
+        # never both towers.
         self.num_layers = num_layers
         self.full_layers = full_layers
         self.dtype = dtype
@@ -91,6 +140,7 @@ class MiniMaxH3TextEncoder:
 
         self.language = None if self.stream_layers else Qwen3VLModel(self.text_config)
         self._stream_layer = Qwen3VLDecoderLayer(self.text_config, layer_idx=0) if self.stream_layers else None
+        self._vision_enabled = bool(load_vision)
         self.vision = VisionModel(self.vision_config) if load_vision else None
         quant_path = model_dir / "quant_config.json"
         self.quantized = quant_path.exists()
@@ -139,6 +189,7 @@ class MiniMaxH3TextEncoder:
             self._load_weights(model_dir, dtype, verbose)
 
         self.image_token_id = raw["image_token_id"]
+        self.video_token_id = raw.get("video_token_id", self.image_token_id)
         self.vision_start_token_id = raw["vision_start_token_id"]
         self.vision_end_token_id = raw["vision_end_token_id"]
         self.merge_size = self.vision_config.spatial_merge_size
@@ -213,8 +264,14 @@ class MiniMaxH3TextEncoder:
             for bucket, module in (("language", self.language), ("vision", self.vision)):
                 if module is None or not updates[bucket]:
                     continue
-                module.update(tree_unflatten(updates[bucket]))
-                mx.eval(*(tensor for _, tensor in updates[bucket]))
+                bucket_updates = dict(updates[bucket])
+                # The vision checkpoint stores conv weights in torch layout; the tower's own
+                # sanitize moves ``patch_embed.proj`` into the channel-last layout mlx's conv3d
+                # expects. Language keys are already stored in mlx layout.
+                if bucket == "vision":
+                    bucket_updates = module.sanitize(bucket_updates)
+                module.update(tree_unflatten(list(bucket_updates.items())))
+                mx.eval(*(tensor for _, tensor in bucket_updates.items()))
             if verbose:
                 print(f"  {Path(shard).name}: {loaded} tensors loaded")
 
@@ -251,10 +308,42 @@ class MiniMaxH3TextEncoder:
     @property
     def processor(self):
         if self._processor is None:
-            from transformers import AutoProcessor
+            from types import SimpleNamespace
 
-            self._processor = AutoProcessor.from_pretrained(str(self._processor_dir))
+            self._processor = SimpleNamespace(
+                image_processor=self._load_image_processor(),
+                tokenizer=self.tokenizer,
+            )
         return self._processor
+
+    def _load_image_processor(self):
+        """Load the PIL-backend image processor without the torch-gated ``Auto`` path.
+
+        The release's ``processor_class`` builds the video processor too, which requires torch;
+        H3's conditioner only ever feeds still images. transformers 5.x gates ``AutoImageProcessor``
+        behind the same import, so resolve the class through the registry directly and prefer the
+        PIL backend.
+        """
+        from transformers.models.auto.configuration_auto import CONFIG_MAPPING
+        from transformers.models.auto.image_processing_auto import IMAGE_PROCESSOR_MAPPING
+
+        entry = IMAGE_PROCESSOR_MAPPING[CONFIG_MAPPING[self.model_config.model_type]]
+        if isinstance(entry, dict):
+            classes = [entry[key] for key in ("pil", "torchvision") if key in entry]
+            classes += [value for key, value in entry.items() if key not in ("pil", "torchvision")]
+        elif isinstance(entry, (tuple, list)):
+            classes = list(entry)
+        else:
+            classes = [entry]
+        last_error: Exception | None = None
+        for cls in classes:
+            try:
+                return cls.from_pretrained(str(self._processor_dir))
+            except Exception as error:  # probe every backend, keep the first that loads
+                last_error = error
+        raise RuntimeError(
+            f"No usable image processor backend for {self._processor_dir}"
+        ) from last_error
 
     # -- request presentation --------------------------------------------------------------
 
@@ -350,6 +439,84 @@ class MiniMaxH3TextEncoder:
         layer.update(tree_unflatten(updates))
         mx.eval(*(tensor for _, tensor in updates))
 
+    def _load_vision_weights(self) -> None:
+        """Stream the BF16 vision tower in for a single encode call.
+
+        Streamed mode never loads weights at construction, so the tower's arrays do not exist
+        until this runs. Its checkpoint keys live under ``model.visual.``; the deepstack mergers
+        are part of the tower, so once its forward has produced the conditioning embeds nothing
+        of it is needed again and the caller releases it before the first decoder layer. A released
+        tower is rebuilt here on the next vision request.
+        """
+        from mlx.utils import tree_flatten, tree_unflatten
+
+        from .selective_loading import load_selected_mlx_tensors
+
+        if self.vision is None:
+            from mlx_vlm.models.qwen3_vl.vision import VisionModel
+
+            self.vision = VisionModel(self.vision_config)
+        vision = self.vision
+        expected = {key for key, _ in tree_flatten(vision.parameters())}
+        prefix = "model.visual."
+        source_by_target = {key[len(prefix) :]: key for key in self._weight_map if key.startswith(prefix)}
+        missing = sorted(expected - source_by_target.keys())
+        if missing:
+            raise KeyError(f"vision tower is missing {len(missing)} tensors, e.g. {missing[:4]}")
+        loaded = load_selected_mlx_tensors(
+            self._model_dir,
+            [source_by_target[key] for key in sorted(expected)],
+        )
+        # The checkpoint stores conv weights in torch layout; the tower's own sanitize moves
+        # ``patch_embed.proj`` into the channel-last layout mlx's conv3d expects.
+        loaded = vision.sanitize(loaded)
+        updates = [
+            (key, loaded[source_by_target[key]].astype(self.dtype))
+            for key in sorted(expected)
+        ]
+        vision.update(tree_unflatten(updates))
+        mx.eval(*(tensor for _, tensor in updates))
+
+    def _release_vision(self) -> None:
+        """Drop the vision tower and return its buffers once its outputs are materialized."""
+        self.vision = None
+        gc.collect()
+        clear_cache = getattr(mx, "clear_cache", None)
+        if clear_cache is not None:
+            clear_cache()
+
+    def _streamed_input_embeddings(self, input_ids: mx.array) -> mx.array:
+        """Materialize the request's token embeddings without keeping the embedding table resident."""
+        embedding_key = "model.language_model.embed_tokens.weight"
+        embedding = self._load_stream_tensor(embedding_key)
+        if self.quantized:
+            from .selective_loading import load_selected_mlx_tensors
+
+            stem = embedding_key[: -len("weight")]
+            aux_keys = [stem + "scales", stem + "biases"]
+            aux = load_selected_mlx_tensors(self._model_dir, aux_keys)
+            # QuantizedEmbedding cannot be used as the streamed layer slot. Select the prompt
+            # rows while they are still packed, then dequantize only those rows; dequantizing
+            # the complete 151936 x 5120 table would defeat low-memory text streaming.
+            h = mx.dequantize(
+                embedding[input_ids],
+                aux[stem + "scales"][input_ids],
+                aux[stem + "biases"][input_ids],
+                group_size=int(self.quant_config["group_size"]),
+                bits=int(self.quant_config["bits"]),
+                mode=str(self.quant_config.get("mode", "affine")),
+            )
+            del aux
+        else:
+            h = embedding[input_ids]
+        mx.eval(h)
+        del embedding
+        gc.collect()
+        clear_cache = getattr(mx, "clear_cache", None)
+        if clear_cache is not None:
+            clear_cache()
+        return h
+
     def _hidden_states(
         self,
         input_ids: mx.array,
@@ -362,36 +529,7 @@ class MiniMaxH3TextEncoder:
         from mlx_vlm.models.base import create_attention_mask
 
         if self.stream_layers:
-            if inputs_embeds is not None or deepstack_visual_embeds is not None:
-                raise ValueError("streamed text encoder does not support vision embeddings")
-            embedding_key = "model.language_model.embed_tokens.weight"
-            embedding = self._load_stream_tensor(embedding_key)
-            if self.quantized:
-                from .selective_loading import load_selected_mlx_tensors
-
-                stem = embedding_key[: -len("weight")]
-                aux_keys = [stem + "scales", stem + "biases"]
-                aux = load_selected_mlx_tensors(self._model_dir, aux_keys)
-                # QuantizedEmbedding cannot be used as the streamed layer slot. Select the prompt
-                # rows while they are still packed, then dequantize only those rows; dequantizing
-                # the complete 151936 x 5120 table would defeat low-memory text streaming.
-                h = mx.dequantize(
-                    embedding[input_ids],
-                    aux[stem + "scales"][input_ids],
-                    aux[stem + "biases"][input_ids],
-                    group_size=int(self.quant_config["group_size"]),
-                    bits=int(self.quant_config["bits"]),
-                    mode=str(self.quant_config.get("mode", "affine")),
-                )
-                del aux
-            else:
-                h = embedding[input_ids]
-            mx.eval(h)
-            del embedding
-            gc.collect()
-            clear_cache = getattr(mx, "clear_cache", None)
-            if clear_cache is not None:
-                clear_cache()
+            h = inputs_embeds if inputs_embeds is not None else self._streamed_input_embeddings(input_ids)
             mask = create_attention_mask(h, None)
             layer = self._stream_layer
             position_embeddings = None
@@ -400,6 +538,8 @@ class MiniMaxH3TextEncoder:
             for layer_idx in range(self.num_layers):
                 self._load_stream_layer(layer_idx)
                 h = layer(h, mask, None, position_ids, position_embeddings)
+                if deepstack_visual_embeds is not None and layer_idx < len(deepstack_visual_embeds):
+                    h = _deepstack_process(h, visual_pos_masks, deepstack_visual_embeds[layer_idx])
                 # Materialize before replacing this slot with the next layer's weights, ensuring
                 # that at most one full decoder layer is resident.
                 mx.eval(h)
@@ -423,39 +563,107 @@ class MiniMaxH3TextEncoder:
 
     def encode(self, prompt: str, images: list | None = None) -> tuple[mx.array, np.ndarray]:
         """Encode a request into ``((1, num_text_tokens, 5120), (num_text_tokens,))``."""
-        from mlx_vlm.models.qwen3_vl.language import LanguageModel
-
         input_ids, token_tags, vision_inputs = self.build_request(prompt, images)
+        if vision_inputs is None:
+            return self.encode_presentation(input_ids, token_tags, None, None, None, None)
+        pixel_values, grid_np = vision_inputs
+        return self.encode_presentation(input_ids, token_tags, pixel_values, grid_np, None, None)
+
+    def encode_presentation(
+        self,
+        input_ids: mx.array,
+        token_tags: np.ndarray,
+        image_pixels: np.ndarray | None,
+        image_grids: np.ndarray | None,
+        video_pixels: np.ndarray | None,
+        video_grids: np.ndarray | None,
+    ) -> tuple[mx.array, np.ndarray]:
+        """Encode a prebuilt request presentation.
+
+        ``image_pixels`` / ``video_pixels`` are the processors' patch arrays —
+        ``(num_patches, channels * temporal * patch * patch)`` each — and the grids are ``(n, 3)``. The
+        vision tower sees images and videos in one forward (images first), and the feature rows are
+        reordered into the combined vision mask's sequence order so both the splice and the
+        deepstack merge line up with the request's interleaved vision blocks.
+        """
+        from mlx_vlm.models.qwen3_vl.language import LanguageModel
 
         inputs_embeds = None
         visual_pos_masks = None
         deepstack_embeds = None
-        grid_thw = None
+        image_grid_thw = None
+        video_grid_thw = None
+        has_vision = image_pixels is not None or video_pixels is not None
 
-        if vision_inputs is not None:
-            if self.vision is None:
+        if has_vision:
+            if not self._vision_enabled:
                 raise ValueError("This encoder was built with `load_vision=False`; it cannot take images.")
-            pixel_values, grid_np = vision_inputs
-            grid_thw = mx.array(grid_np.astype(np.int32))
+            parts, grids = [], []
+            if image_pixels is not None:
+                parts.append(mx.array(np.asarray(image_pixels)))
+                image_grid_thw = mx.array(np.asarray(image_grids, np.int32))
+                grids.append(np.asarray(image_grids, np.int64))
+            if video_pixels is not None:
+                parts.append(mx.array(np.asarray(video_pixels)))
+                video_grid_thw = mx.array(np.asarray(video_grids, np.int32))
+                grids.append(np.asarray(video_grids, np.int64))
+            if self.stream_layers:
+                self._load_vision_weights()
             hidden, deepstack_embeds = self.vision(
-                mx.array(pixel_values).astype(self.dtype), grid_thw, output_hidden_states=True
+                mx.concatenate(parts, axis=0).astype(self.dtype),
+                mx.array(np.concatenate(grids, axis=0).astype(np.int32)),
+                output_hidden_states=True,
             )
-            inputs_embeds = self.language.embed_tokens(input_ids)
+            if self.stream_layers:
+                # The tower has produced everything the language stack needs. Materialize those
+                # outputs and free the tower before the embedding table or any decoder layer can
+                # push peak residency past one component at a time.
+                mx.eval(hidden, *(embed for embed in deepstack_embeds))
+                self._release_vision()
+
             image_mask = input_ids == self.image_token_id
-            inputs_embeds = mx.where(image_mask[..., None], hidden.astype(inputs_embeds.dtype)[None], inputs_embeds)
-            visual_pos_masks = image_mask
+            video_mask = input_ids == self.video_token_id
+            visual_pos_masks = image_mask | video_mask
+            if video_pixels is not None and bool(mx.max(video_mask).item()):
+                # The tower emitted image rows then video rows, but the vision blocks appear in the
+                # sequence in request order. Reorder the feature rows (and every deepstack level)
+                # into the combined mask's sequence order so the splice and the merge line up.
+                img_positions = np.where(np.asarray(image_mask[0]))[0]
+                vid_positions = np.where(np.asarray(video_mask[0]))[0]
+                feature_rows = np.concatenate(
+                    [np.arange(len(img_positions)), len(img_positions) + np.arange(len(vid_positions))]
+                )
+                combined = np.concatenate([img_positions, vid_positions])
+                rows = mx.array(feature_rows[np.argsort(combined)].astype(np.int32))
+                hidden = hidden[rows]
+                deepstack_embeds = [embed[rows] for embed in deepstack_embeds]
+            if not self.stream_layers:
+                inputs_embeds = _splice_vision_rows(
+                    self.language.embed_tokens(input_ids), visual_pos_masks, hidden
+                )
 
         # Qwen3-VL's 3D M-RoPE index, derived from the vision-start/pad token ids.
         position_ids, _ = LanguageModel.get_rope_index(
-            self, input_ids, image_grid_thw=grid_thw, video_grid_thw=None, attention_mask=None
+            self,
+            input_ids,
+            image_grid_thw=image_grid_thw,
+            video_grid_thw=video_grid_thw,
+            attention_mask=None,
         )
+
+        if self.stream_layers and has_vision:
+            # Streamed splicing: build the request embedding here so the vision rows replace the
+            # vision-token rows before any decoder layer streams in, then let go of the table.
+            text_embeds = self._streamed_input_embeddings(input_ids)
+            inputs_embeds = _splice_vision_rows(text_embeds, visual_pos_masks, hidden)
+            mx.eval(inputs_embeds)
 
         hidden_states = self._hidden_states(
             input_ids,
             position_ids,
             inputs_embeds=inputs_embeds,
             visual_pos_masks=visual_pos_masks,
-            deepstack_visual_embeds=deepstack_embeds,
+            deepstack_visual_embeds=deepstack_embeds if has_vision else None,
         )
         mx.eval(hidden_states)
         return hidden_states, token_tags
