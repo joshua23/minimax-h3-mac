@@ -198,6 +198,17 @@ def build_parser() -> argparse.ArgumentParser:
         help="anchor for each --image, in order",
     )
     parser.add_argument(
+        "--reference",
+        action="append",
+        default=None,
+        metavar="KIND:PATH",
+        help=(
+            "ref2va omni-reference as KIND:PATH, KIND one of image|video|audio (repeatable); "
+            "the order given is the order the model reads them in, and a video reference carries "
+            "its own soundtrack. Needs the Ref2VA transformer as --transformer"
+        ),
+    )
+    parser.add_argument(
         "--keep-adaln",
         action="store_true",
         help="keep the 13B adaln_proj resident instead of caching and dropping it",
@@ -428,13 +439,26 @@ def main(argv: Sequence[str] | None = None) -> int:
         images = [ImageOps.exif_transpose(Image.open(p).convert("RGB")) for p in args.image]
     anchors = tuple(args.anchor or ())
 
+    references = None
+    if args.reference:
+        if images or anchors:
+            parser.error("--image/--anchor (fl2va keyframes) and --reference (ref2va) are different tasks; pass one, not both")
+        from minimax_h3_mlx.ref2va import Reference
+
+        references = []
+        for entry in args.reference:
+            kind, sep, path = entry.partition(":")
+            if kind not in ("image", "video", "audio") or not sep or not path:
+                parser.error(f"--reference must be KIND:PATH with KIND one of image|video|audio, got {entry!r}")
+            references.append(Reference(**{kind: path}))
+
     profiler = ForwardPassProfiler() if args.forward_profile_json else None
     profile_write_error: str | None = None
     with active_profiler(profiler):
         pipe = MiniMaxH3Pipeline.from_pretrained(
             args.checkpoint,
             transformer_dir=args.transformer,
-            load_vision=bool(images),
+            load_vision=bool(images or references),
             stream_blocks=args.stream_blocks or args.low_memory,
             low_memory=args.low_memory,
             text_encoder_dir=args.text_encoder,
@@ -459,6 +483,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             seed=args.seed,
             images=images,
             keyframe_anchors=anchors,
+            references=references,
             height=args.height,
             width=args.width,
             drop_adaln=not args.keep_adaln,

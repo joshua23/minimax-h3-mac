@@ -18,6 +18,7 @@ import gc
 import time
 from dataclasses import dataclass
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import mlx.core as mx
 import numpy as np
@@ -34,12 +35,15 @@ from .forward_profile import profiled_call
 from .packing import (
     AUDIO_CHANNELS,
     FPS,
+    KEYFRAME_ENCODE_SEED,
     KEYFRAME_NOISE_AUG,
     PIXEL_MEAN,
     PIXEL_STD,
     align_num_frames,
     audio_latent_num_frames,
     build_packed_sequence,
+    build_motion_context_packed_sequence,
+    build_ref2va_packed_sequence,
     build_row_timesteps,
     patchify_video_latents,
     resolve_canvas_size,
@@ -48,6 +52,9 @@ from .packing import (
     video_latent_num_frames,
 )
 from .scheduler import MiniMaxH3Scheduler
+
+if TYPE_CHECKING:
+    from .motion_context import ClipLatents
 
 
 def _call_mlx_memory_control(name: str, *args) -> bool:
@@ -93,6 +100,8 @@ class GenerationResult:
     seconds_per_step: float = 0.0
     total_seconds: float = 0.0
     block_cache_stats: dict[str, int | float] | None = None
+    video_latents: np.ndarray | None = None  # (1, C, T, H, W) normalized — chaining input
+    audio_latents: np.ndarray | None = None  # (2, A, T) normalized, channel-major
 
 
 def detach_bfloat16(array: mx.array) -> mx.array:
@@ -441,6 +450,156 @@ class MiniMaxH3Pipeline:
 
     # -- generation ---------------------------------------------------------------------------
 
+    # -- ref2va conditioning ------------------------------------------------------------------
+
+    def _encode_ref2va_text(self, prompt: str, references: list):
+        """Build MiniMax-H3's ref2va presentation and encode it through the conditioner."""
+        from .config import TAG_TEXT, TAG_VIDEO
+        from .ref2va import build_ref2va_presentation, preprocess_reference_video, sample_reference_video_frames
+
+        encoder = self.text_encoder
+        tokenizer = encoder.tokenizer
+        merge = encoder.processor.image_processor.merge_size**2
+
+        image_token_counts: list[int] = []
+        image_pixels = image_grids = None
+        images = [reference.image for reference in references if reference.kind == "image"]
+        if images:
+            vision = encoder.processor.image_processor(images=images, return_tensors="np")
+            image_pixels = np.asarray(vision["pixel_values"])
+            image_grids = np.asarray(vision["image_grid_thw"])
+            image_token_counts = [int(grid.prod()) // merge for grid in image_grids]
+
+        video_block_token_counts: list[int] = []
+        video_pixels_list, video_grids_list = [], []
+        for reference in (r for r in references if r.kind == "video"):
+            sampled, block_timestamps = sample_reference_video_frames(reference.frames)
+            reference.block_timestamps = block_timestamps
+            pixels, grid = preprocess_reference_video(np.stack(sampled))
+            if int(grid[0][0]) != len(block_timestamps):
+                raise ValueError(
+                    f"The video reference merged into {int(grid[0][0])} vision blocks, but "
+                    f"{len(block_timestamps)} of them were labelled."
+                )
+            video_pixels_list.append(pixels)
+            video_grids_list.append(grid)
+            video_block_token_counts.append(int(grid[0][1]) * int(grid[0][2]) // merge)
+        video_pixels = np.concatenate(video_pixels_list) if video_pixels_list else None
+        video_grids = np.concatenate(video_grids_list) if video_grids_list else None
+
+        token_ids, token_tags = build_ref2va_presentation(
+            tokenizer,
+            prompt,
+            references,
+            image_token_counts,
+            video_block_token_counts,
+            TAG_TEXT,
+            TAG_VIDEO,
+            encoder.vision_start_token_id,
+            encoder.vision_end_token_id,
+            tokenizer.convert_tokens_to_ids("<|image_pad|>"),
+            tokenizer.convert_tokens_to_ids("<|video_pad|>"),
+        )
+        input_ids = mx.array(np.array([token_ids], dtype=np.int32))
+        return encoder.encode_presentation(
+            input_ids,
+            np.array(token_tags, dtype=np.int64),
+            image_pixels,
+            image_grids,
+            video_pixels,
+            video_grids,
+        )
+
+    def _encode_reference_video_frames(self, frames: np.ndarray):
+        """Normalize and encode one temporal chunk at a time, keeping host pixels bounded."""
+        cfg = self._video_config
+        mean = np.array(PIXEL_MEAN, np.float32).reshape(1, 1, 1, 3)
+        std = np.array(PIXEL_STD, np.float32).reshape(1, 1, 1, 3)
+        chunks = []
+        for start in range(0, len(frames), cfg.clip_length):
+            pixels = frames[start:start + cfg.clip_length].astype(np.float32)
+            if len(pixels) < cfg.clip_length:
+                pixels = np.concatenate([pixels, np.repeat(pixels[-1:], cfg.clip_length - len(pixels), axis=0)])
+            pixels /= 255.0
+            pixels -= mean
+            pixels /= std
+            x = mx.array(pixels[None])
+            encoded = self.video_vae._encode_clip(x)
+            mx.eval(encoded)
+            chunks.append(encoded)
+            del pixels, x
+        moments = mx.concatenate(chunks, axis=1)
+        if cfg.token_drop > 0:
+            moments = moments[:, :-cfg.token_drop]
+        return moments.transpose(0, 4, 1, 2, 3)
+
+    def _encode_reference_media(self, references: list):
+        """Encode the references through the VAEs and resolve their latent geometry.
+
+        Image and video references take the recipe the fl2va keyframes use — posterior **sampled**
+        under a fresh seed-42 draw per reference, the sample rounded through float16 before
+        normalization — except a video goes through the 17-frames-per-chunk temporal encoding.
+        Reference soundtracks take the posterior **mean** and are never sampled.
+        """
+        from .ref2va import trim_reference_num_frames
+
+        cfg = self._video_config
+        latents_mean = mx.array(np.array(cfg.latents_mean, np.float32)).reshape(1, -1, 1, 1, 1)
+        latents_std = mx.array(np.array(cfg.latents_std, np.float32)).reshape(1, -1, 1, 1, 1)
+        pixel_mean = np.array(PIXEL_MEAN, np.float32).reshape(1, 3, 1, 1, 1)
+        pixel_std = np.array(PIXEL_STD, np.float32).reshape(1, 3, 1, 1, 1)
+        audio_cfg = self._audio_config
+        audio_mean = mx.array(np.array(audio_cfg.latents_mean, np.float32)).reshape(1, -1, 1)
+        audio_std = mx.array(np.array(audio_cfg.latents_std, np.float32)).reshape(1, -1, 1)
+
+        video_rows, audio_rows = [], []
+        for reference in references:
+            if reference.kind != "audio":
+                if reference.kind == "image":
+                    pixels = np.asarray(reference.image, dtype=np.float32).transpose(2, 0, 1)[None, :, None]
+                channels = cfg.latent_channels
+                if reference.kind == "image":
+                    pixels = (pixels / 255.0 - pixel_mean) / pixel_std
+                    x = mx.array(pixels)
+                    # _encode_clip returns channels-last moments (B, F, H, W, 2C).
+                    moments = self.video_vae._encode_clip(x.transpose(0, 2, 3, 4, 1))
+                    mean, logvar = moments[..., :channels], moments[..., channels:]
+                    mx.random.seed(KEYFRAME_ENCODE_SEED)
+                    latent = mean + mx.exp(0.5 * mx.clip(logvar, -30.0, 20.0)) * mx.random.normal(mean.shape)
+                    latent = latent.transpose(0, 4, 1, 2, 3)
+                else:
+                    # encode() returns channels-first moments (B, 2C, F, H, W).
+                    frames = reference.frames[: trim_reference_num_frames(reference.frames.shape[0])]
+                    moments = self._encode_reference_video_frames(frames)
+                    mean, logvar = moments[:, :channels], moments[:, channels:]
+                    mx.random.seed(KEYFRAME_ENCODE_SEED)
+                    latent = mean + mx.exp(0.5 * mx.clip(logvar, -30.0, 20.0)) * mx.random.normal(mean.shape)
+                # A fresh seed-42 draw per reference, as the reference implementation's per-call
+                # generator does; the sample rounds through float16 like every conditioning latent.
+                latent = latent.astype(mx.float16).astype(mx.float32)
+                normalized = (latent - latents_mean) / latents_std
+                reference.num_latent_frames = int(latent.shape[2])
+                reference.latent_height = int(latent.shape[3])
+                reference.latent_width = int(latent.shape[4])
+                rows = patchify_video_latents(normalized, self._dit_config.patch_size)
+                mx.eval(rows)
+                video_rows.append(rows)
+
+            if reference.has_audio:
+                waveform = mx.array(np.asarray(reference.waveform, np.float32))[:, None, :]
+                mean, _ = self.audio_vae.encode(waveform)
+                # Channel-major rows: the two stereo channels are two batch items of the mono VAE.
+                latents = (mean - audio_mean) / audio_std
+                reference.num_audio_latents = int(latents.shape[2])
+                audio_rows.append(
+                    latents.transpose(0, 2, 1).reshape(-1, self._audio_config.latent_channels)
+                )
+                mx.eval(audio_rows[-1])
+        return (
+            mx.concatenate(video_rows) if video_rows else None,
+            mx.concatenate(audio_rows) if audio_rows else None,
+        )
+
     def __call__(
         self,
         prompt: str,
@@ -450,6 +609,11 @@ class MiniMaxH3Pipeline:
         seed: int = 0,
         images: list | None = None,
         keyframe_anchors: tuple[str, ...] = (),
+        references: list | None = None,
+        context: "ClipLatents | None" = None,
+        context_video_frames: int = 22,
+        context_audio_frames: int = 24,
+        return_latents: bool = False,
         height: int | None = None,
         width: int | None = None,
         drop_adaln: bool = True,
@@ -463,6 +627,17 @@ class MiniMaxH3Pipeline:
             duration_seconds: 5 to 15; snapped up to the ``17n + 5`` frame grid the VAE encodes.
             num_inference_steps: the weights are CFG-distilled, so each step is one forward.
             keyframe_anchors: ``"first"`` / ``"last"`` per conditioning keyframe, in packed order.
+            references: ``ref2va`` omni-references (:class:`ref2va.Reference`), in the order the
+                model should read them. Needs the Ref2VA transformer as ``--transformer``.
+            context: the previous clip's latents (:class:`motion_context.ClipLatents`) for a
+                chained shot: its tail frames and tail sound are pinned as conditioning, and the
+                pinned head is trimmed off the delivered clip.
+            context_video_frames: frames of the previous clip's picture to pin (whole-latent-step
+                windows: 5, 22, 39 or 56).
+            context_audio_frames: frames of tail sound to pin, end-aligned with the join
+                (0 follows the video window; 24 is the last second).
+            return_latents: attach this clip's normalized latents to the result, the chaining
+                input of the next shot.
             height, width: override the canvas ``aspect`` would resolve to. Both must be multiples
                 of 32. H3 was released for a 768-pixel short edge only, so anything else is
                 off-distribution — useful for exercising the pipeline, not for quality.
@@ -470,9 +645,66 @@ class MiniMaxH3Pipeline:
                 text stream once and reuses it for every denoising DiT call.
         """
         run_started = time.perf_counter()
+        if references is not None and (images or keyframe_anchors):
+            raise ValueError("Keyframe images and Ref2VA references cannot be combined in one request.")
+        if context is not None and (images or keyframe_anchors or references is not None):
+            raise ValueError(
+                "Motion context chains an fl2va-family clip; pass it alone, not with keyframe "
+                "images or ref2va references."
+            )
 
-        if self._low_memory and images:
-            raise NotImplementedError("low-memory mode currently supports text-to-video only")
+        # Geometry. References never bind the generated canvas: the aspect (or explicit size) does.
+        if height is None or width is None:
+            height, width = resolve_canvas_size(*aspect)
+        elif height % 32 or width % 32:
+            raise ValueError(f"`height` and `width` must be multiples of 32, got {height}x{width}.")
+        num_frames = align_num_frames(int(round(duration_seconds * FPS)))
+        num_latent_frames = video_latent_num_frames(num_frames)
+        ratio = self._video_config.spatial_compression_ratio
+        latent_height, latent_width = height // ratio, width // ratio
+        num_audio_latents = audio_latent_num_frames(num_frames)
+        patch_size = self._dit_config.patch_size
+
+        prepared_references = None
+        if references is not None:
+            from .ref2va import check_references, prepare_references
+
+            check_references(references)
+            prepared_references, _ = prepare_references(
+                references, num_frames, self._audio_config.sampling_rate
+            )
+
+        motion = None
+        if context is not None:
+            from .motion_context import build_motion_context
+
+            if (
+                context.video.shape[1] != self._video_config.latent_channels
+                or tuple(context.video.shape[3:]) != (latent_height, latent_width)
+                or context.audio.shape[0] != 2
+                or context.audio.shape[1] != self._audio_config.latent_channels
+            ):
+                raise ValueError(
+                    f"The context clip carries latents {tuple(context.video.shape)}/"
+                    f"{tuple(context.audio.shape)} but this clip runs at C="
+                    f"{self._video_config.latent_channels}, ({latent_height}, {latent_width}) / "
+                    f"(2, {self._audio_config.latent_channels}); a latent cannot be resized, so "
+                    "regenerate the previous clip at this resolution."
+                )
+            motion = build_motion_context(
+                context,
+                patch_size,
+                context_frames=context_video_frames,
+                context_audio_frames=context_audio_frames,
+            )
+            if verbose:
+                print(
+                    f"motion context: pinning {motion.covered} frames ({motion.steps} latent steps) "
+                    f"+ {motion.audio_steps} audio steps of tail sound; delivered trim "
+                    f"{motion.trim_frames} frames",
+                    flush=True,
+                )
+
         if self._low_memory:
             from .text_encoder import MiniMaxH3TextEncoder
 
@@ -481,7 +713,7 @@ class MiniMaxH3Pipeline:
                 "load_overhead",
                 lambda: MiniMaxH3TextEncoder(
                     self._text_encoder_path,
-                    load_vision=False,
+                    load_vision=bool(images or prepared_references is not None),
                     verbose=verbose,
                     tokenizer_dir=self._checkpoint_root / "tokenizer",
                     processor_dir=self._checkpoint_root / "processor",
@@ -490,18 +722,71 @@ class MiniMaxH3Pipeline:
                 eval_output=False,
             )
 
-        # 1. Text conditioning. Keyframe vision blocks come back tagged as *video* rows.
-        prompt_embeds, text_token_tags = profiled_call(
-            "pipeline.text_encoder_encode",
-            "text_conditioning",
-            lambda: self.text_encoder.encode(prompt, images),
-            metadata={"has_images": bool(images)},
-        )
+        # 1. Text conditioning. Keyframe and reference vision blocks come back tagged as *video* rows.
+        if prepared_references is not None:
+            prompt_embeds, text_token_tags = profiled_call(
+                "pipeline.text_encoder_encode",
+                "text_conditioning",
+                lambda: self._encode_ref2va_text(prompt, prepared_references),
+                metadata={"has_references": True},
+            )
+        else:
+            prompt_embeds, text_token_tags = profiled_call(
+                "pipeline.text_encoder_encode",
+                "text_conditioning",
+                lambda: self.text_encoder.encode(prompt, images),
+                metadata={"has_images": bool(images)},
+            )
         if self._low_memory:
             prompt_embeds = detach_bfloat16(prompt_embeds)
             text_token_tags = np.array(text_token_tags, copy=True)
             self._release_component("text_encoder")
 
+        # 2. Conditioning (VAE phase) — run *before* the streaming DiT loads, so the VAE and the
+        #    DiT never co-reside in low-memory mode.
+        condition_rows = None
+        ref_video_rows = None
+        ref_audio_rows = None
+        needs_video_vae = bool(
+            images or (prepared_references is not None and any(r.kind != "audio" for r in prepared_references))
+        )
+        needs_audio_vae = prepared_references is not None and any(r.has_audio for r in prepared_references)
+        if self._low_memory and (needs_video_vae or needs_audio_vae):
+            from .load import load_audio_vae, load_video_vae
+
+            if needs_video_vae:
+                self.video_vae = profiled_call(
+                    "load.video_vae_conditioning",
+                    "load_overhead",
+                    lambda: load_video_vae(self._checkpoint_root / "video_vae", encode_only=True),
+                    eval_output=False,
+                )
+            if needs_audio_vae:
+                self.audio_vae = profiled_call(
+                    "load.audio_vae_conditioning",
+                    "load_overhead",
+                    lambda: load_audio_vae(self._checkpoint_root / "audio_vae"),
+                    eval_output=False,
+                )
+        if images:
+            condition_rows = profiled_call(
+                "pipeline.encode_keyframes",
+                "conditioning_encode",
+                lambda: self._encode_keyframes(images, height, width),
+            )
+        if prepared_references is not None:
+            ref_video_rows, ref_audio_rows = profiled_call(
+                "pipeline.encode_references",
+                "conditioning_encode",
+                lambda: self._encode_reference_media(prepared_references),
+            )
+        if self._low_memory and (needs_video_vae or needs_audio_vae):
+            if needs_video_vae:
+                self._release_component("video_vae")
+            if needs_audio_vae:
+                self._release_component("audio_vae")
+
+        if self._low_memory:
             from .streaming import load_streaming_dit
 
             self.dit, self._block_provider = profiled_call(
@@ -527,41 +812,46 @@ class MiniMaxH3Pipeline:
             if self._memory_pressure_guard:
                 self._memory_guard_boundary()
 
-        # 2. Geometry.
-        if height is None or width is None:
-            height, width = resolve_canvas_size(*aspect)
-        elif height % 32 or width % 32:
-            raise ValueError(f"`height` and `width` must be multiples of 32, got {height}x{width}.")
-        num_frames = align_num_frames(int(round(duration_seconds * FPS)))
-        num_latent_frames = video_latent_num_frames(num_frames)
-        ratio = self._video_config.spatial_compression_ratio
-        latent_height, latent_width = height // ratio, width // ratio
-        num_audio_latents = audio_latent_num_frames(num_frames)
-        patch_size = self._dit_config.patch_size
-
-        layout = build_packed_sequence(
-            text_token_tags,
-            num_latent_frames,
-            latent_height,
-            latent_width,
-            num_audio_latents,
-            patch_size,
-            keyframe_anchors,
-        )
+        if prepared_references is not None:
+            layout = build_ref2va_packed_sequence(
+                text_token_tags,
+                prepared_references,
+                num_latent_frames,
+                latent_height,
+                latent_width,
+                num_audio_latents,
+                patch_size,
+            )
+        elif motion is not None:
+            layout = build_motion_context_packed_sequence(
+                text_token_tags,
+                motion.steps,
+                motion.offsets,
+                motion.num_condition_video_rows,
+                motion.num_condition_audio_rows,
+                motion.audio_steps,
+                motion.audio_start_coord,
+                num_latent_frames,
+                latent_height,
+                latent_width,
+                num_audio_latents,
+                patch_size,
+            )
+        else:
+            layout = build_packed_sequence(
+                text_token_tags,
+                num_latent_frames,
+                latent_height,
+                latent_width,
+                num_audio_latents,
+                patch_size,
+                keyframe_anchors,
+            )
         if verbose:
             print(f"canvas {width}x{height}, {num_frames} frames ({num_latent_frames} latent), "
                   f"{num_audio_latents} audio latents")
             print(f"packed sequence: {layout.sequence_length:,} rows "
                   f"({len(text_token_tags):,} text, {layout.num_condition_video_rows:,} condition)")
-
-        # 3. Keyframe conditioning rows, encoded before any request noise is drawn.
-        condition_rows = None
-        if images:
-            condition_rows = profiled_call(
-                "pipeline.encode_keyframes",
-                "conditioning_encode",
-                lambda: self._encode_keyframes(images, height, width),
-            )
 
         # 4. Initial noise. Draw order matches the reference — the conditioning noise comes off the
         #    request generator first, then video, then audio — so a seed reproduces the same run.
@@ -571,6 +861,27 @@ class MiniMaxH3Pipeline:
             # Anchors are not fully clean: they are noised to t = 0.999 and held there every step.
             condition_rows = MiniMaxH3Scheduler(shift=self.config.sigma_shift_video).scale_noise(
                 condition_rows, KEYFRAME_NOISE_AUG, condition_noise
+            )
+        if ref_video_rows is not None:
+            # Reference visuals ride at the keyframe conditioning level; reference soundtracks stay
+            # clean (t = 1.0) and are concatenated without any noise draw at all.
+            ref_noise = mx.random.normal(ref_video_rows.shape).astype(mx.float32)
+            ref_video_rows = MiniMaxH3Scheduler(shift=self.config.sigma_shift_video).scale_noise(
+                ref_video_rows, KEYFRAME_NOISE_AUG, ref_noise
+            )
+        if motion is not None:
+            # The pinned head is noised to the keyframe conditioning level like any anchor; the
+            # seam audio rides clean and costs no noise draw at all.
+            pin_noise = mx.random.normal(motion.video_rows.shape).astype(mx.float32)
+            pinned_video_rows = MiniMaxH3Scheduler(shift=self.config.sigma_shift_video).scale_noise(
+                mx.array(np.asarray(motion.video_rows, np.float32)),
+                KEYFRAME_NOISE_AUG,
+                pin_noise,
+            )
+            pinned_audio_rows = (
+                mx.array(np.asarray(motion.audio_rows, np.float32))
+                if motion.audio_rows is not None
+                else None
             )
 
         latents = mx.random.normal(
@@ -582,6 +893,14 @@ class MiniMaxH3Pipeline:
         ).astype(mx.float32)
         if condition_rows is not None:
             video_rows = mx.concatenate([condition_rows, video_rows])
+        if ref_video_rows is not None:
+            video_rows = mx.concatenate([ref_video_rows, video_rows])
+        if ref_audio_rows is not None:
+            audio_rows = mx.concatenate([ref_audio_rows, audio_rows])
+        if motion is not None:
+            video_rows = mx.concatenate([pinned_video_rows, video_rows])
+            if pinned_audio_rows is not None:
+                audio_rows = mx.concatenate([pinned_audio_rows, audio_rows])
 
         # 5. Two schedules over one shared forward.
         video_sched, audio_sched = self._build_schedules(num_inference_steps)
@@ -737,6 +1056,30 @@ class MiniMaxH3Pipeline:
                 eval_output=False,
             )
         total = time.perf_counter() - run_started
+
+        # The pinned head occupies the front of the new timeline and is re-generated as context;
+        # the delivered clip starts at the join, picture and sound together.
+        if motion is not None:
+            video = video[motion.covered :]
+            audio = audio[:, int(round(motion.covered / FPS * self._audio_config.sampling_rate)) :]
+
+        video_latents = audio_latents = None
+        if return_latents:
+            # The tail of the row arrays is the generated target in both load modes — exactly the
+            # normalized latents the denoiser wrote, the next shot's chaining input.
+            target_video_rows = video_rows[-num_latent_frames * (latent_height // patch_size[1]) * (latent_width // patch_size[2]) :]
+            video_latents = np.array(
+                unpatchify_video_tokens(
+                    target_video_rows,
+                    num_latent_frames,
+                    latent_height,
+                    latent_width,
+                    self._video_config.latent_channels,
+                    patch_size,
+                )
+            )
+            audio_latents = np.array(unpack_audio_tokens(audio_rows[-num_audio_latents * AUDIO_CHANNELS :], num_audio_latents))
+
         return GenerationResult(
             video=video,
             audio=audio,
@@ -744,6 +1087,8 @@ class MiniMaxH3Pipeline:
             seconds_per_step=sum(step_times) / max(len(step_times), 1),
             total_seconds=total,
             block_cache_stats=block_cache.stats() if block_cache is not None else None,
+            video_latents=video_latents,
+            audio_latents=audio_latents,
         )
 
     # -- decoding -----------------------------------------------------------------------------

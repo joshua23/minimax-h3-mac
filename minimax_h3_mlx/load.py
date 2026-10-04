@@ -172,7 +172,7 @@ def read_video_vae_config(model_dir: str | Path):
     )
 
 
-def load_video_vae(model_dir: str | Path, strict: bool = True):
+def load_video_vae(model_dir: str | Path, strict: bool = True, *, encode_only: bool = False):
     """Load the video VAE from a released ``video_vae/`` directory.
 
     The weights live in ``source/model.safetensors`` under the original CompVis-style names, which
@@ -206,12 +206,14 @@ def load_video_vae(model_dir: str | Path, strict: bool = True):
         latents_mean=tuple(wrapper.get("latents_mean", ())),
         latents_std=tuple(wrapper.get("latents_std", ())),
     )
-    model = VideoVAE(config)
+    model = VideoVAE(config, encode_only=encode_only)
     expected = {key for key, _ in tree_flatten(model.parameters())}
 
     weights: dict[str, mx.array] = {}
     unexpected: list[str] = []
     for key, tensor in mx.load(str(model_dir / "source" / "model.safetensors")).items():
+        if encode_only and key.startswith(("decoder.", "post_quant_conv.")):
+            continue
         # An all-zero buffer of the masked-autoencoding objective; the decoder never reads it.
         if key == "decoder.mask_token":
             continue

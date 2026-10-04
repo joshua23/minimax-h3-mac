@@ -164,7 +164,10 @@ class ResnetBlock3d(nn.Module):
     def __call__(self, x: mx.array) -> mx.array:
         residual = x
         h = self.conv1(nn.silu(self.norm1(x)))
-        h = self.conv2(nn.silu(self.norm2(h)))
+        mx.eval(h)
+        h = nn.silu(self.norm2(h))
+        mx.eval(h)
+        h = self.conv2(h)
         if "nin_shortcut" in self:
             residual = self.nin_shortcut(residual)
         return residual + h
@@ -216,6 +219,8 @@ class DownBlock3d(nn.Module):
     def __call__(self, x: mx.array) -> mx.array:
         for resnet in self.block:
             x = resnet(x)
+            # Bound the live 3D convolution graph for reference-video encoding.
+            mx.eval(x)
         if "downsample" in self:
             x = self.downsample(x)
         return x
@@ -443,13 +448,13 @@ class VideoVAE(nn.Module):
     everything internal is channels-last.
     """
 
-    def __init__(self, config: VideoVAEConfig):
+    def __init__(self, config: VideoVAEConfig, encode_only: bool = False):
         super().__init__()
         self.config = config
         self.encoder = Encoder3d(config)
-        self.decoder = ViTDecoder3d(config)
+        self.decoder = None if encode_only else ViTDecoder3d(config)
         self.quant_conv = CausalConv3d(2 * config.latent_channels, 2 * config.latent_channels, 1)
-        self.post_quant_conv = CausalConv3d(config.latent_channels, config.latent_channels, 1)
+        self.post_quant_conv = None if encode_only else CausalConv3d(config.latent_channels, config.latent_channels, 1)
 
         ratio_t = config.temporal_compression_ratio
         self.frame_pre_padding = (-config.clip_length) % ratio_t
@@ -587,13 +592,12 @@ class VideoVAE(nn.Module):
             tail = mx.broadcast_to(x[:, -1:], (x.shape[0], pad, *x.shape[2:]))
             x = mx.concatenate([x, tail], axis=1)
 
-        moments = mx.concatenate(
-            [
-                self._encode_clip(x[:, i * clip_length : (i + 1) * clip_length])
-                for i in range(x.shape[1] // clip_length)
-            ],
-            axis=1,
-        )
+        chunks = []
+        for i in range(x.shape[1] // clip_length):
+            chunk = self._encode_clip(x[:, i * clip_length : (i + 1) * clip_length])
+            mx.eval(chunk)
+            chunks.append(chunk)
+        moments = mx.concatenate(chunks, axis=1)
         if self.config.token_drop > 0:
             moments = moments[:, : -self.config.token_drop]
         return moments.transpose(0, 4, 1, 2, 3)
@@ -606,6 +610,8 @@ class VideoVAE(nn.Module):
         linearly cross-faded. Latent frames are repeated at the end when the length is not a whole
         number of chunks, and the extra pixel frames are cut off again.
         """
+        if self.decoder is None:
+            raise RuntimeError("This VideoVAE was loaded for encoding only; load the full VAE to decode.")
         z = z.transpose(0, 2, 3, 4, 1)  # -> (B, D, H, W, C)
         chunk_tokens = self.tokens_chunk_size
         token_drop = self.config.token_drop
