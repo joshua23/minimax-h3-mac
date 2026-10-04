@@ -493,6 +493,114 @@ def build_packed_sequence(
     )
 
 
+def build_motion_context_packed_sequence(
+    text_token_tags: np.ndarray | list[int],
+    context_steps: int,
+    context_offsets: list[int],
+    context_video_rows: int,
+    context_audio_rows: int,
+    context_audio_steps: int,
+    context_audio_start_coord: int,
+    num_latent_frames: int,
+    latent_height: int,
+    latent_width: int,
+    num_audio_latents: int,
+    patch_size: tuple[int, int, int],
+) -> PackedSequence:
+    """Build the layout of a chained clip: ``[text | pinned head | seam audio | target audio | target video]``.
+
+    The pinned head re-generates the previous clip's tail on the new timeline: its rows share the
+    rope coordinates of the target's first ``covered`` frames (one row-block per latent step at
+    ``origin + 5/3 * pixel offset``, exactly where the target's own steps sit), are held at the
+    keyframe conditioning level, and are trimmed off the delivery. The pinned audio window is
+    **end-aligned with the join** — it reaches backwards from the cut on the target's 40 Hz grid —
+    and rides clean, which is what makes the generated soundtrack continue the previous one rather
+    than restart. The target video and audio cover the full new timeline, unchanged from a plain
+    generation.
+    """
+    _, ph, pw = patch_size
+    text_tags = np.asarray(text_token_tags, dtype=np.int64)
+    num_text = int(text_tags.shape[0])
+    rows_per_frame = (latent_height // ph) * (latent_width // pw)
+    if context_video_rows != context_steps * rows_per_frame:
+        raise ValueError(
+            f"Expected {context_steps * rows_per_frame} pinned video rows for {context_steps} steps, "
+            f"got {context_video_rows}."
+        )
+    num_target_video_rows = num_latent_frames * rows_per_frame
+    num_target_audio_rows = num_audio_latents * AUDIO_CHANNELS
+    seq_len = num_text + context_video_rows + context_audio_rows + num_target_audio_rows + num_target_video_rows
+
+    position_ids = np.zeros((seq_len, 3), dtype=np.float64)
+    position_ids[:num_text, 0] = np.arange(num_text, dtype=np.float64)
+
+    frame_grid, width_grid = _frame_position_grid(latent_height, latent_width, ph, pw)
+
+    # The pinned head: one row-block per latent step at the timeline position that step occupies.
+    cond_start = num_text
+    for k, offset in enumerate(context_offsets):
+        rows = slice(cond_start + k * rows_per_frame, cond_start + (k + 1) * rows_per_frame)
+        position_ids[rows, 0] = float(num_text) + _ROPE_FRAME_RESCALE * float(offset)
+        position_ids[rows, 1:] = frame_grid
+
+    # The seam audio window: end-aligned with the join, reaching backwards on the target's 40 Hz
+    # grid, pinned to the target's own width extremes — it is part of the target's soundtrack
+    # space, which is exactly what makes it a continuation rather than a reference.
+    audio_start = cond_start + context_video_rows
+    if context_audio_steps:
+        times = context_audio_start_coord + np.arange(context_audio_steps, dtype=np.float64)
+        position_ids[audio_start : audio_start + context_audio_rows, 0] = np.tile(times, AUDIO_CHANNELS)
+        position_ids[audio_start : audio_start + context_audio_rows, 2] = np.concatenate(
+            [
+                np.full(context_audio_steps, float(width_grid[0]), dtype=np.float64),
+                np.full(context_audio_steps, float(width_grid[-1]), dtype=np.float64),
+            ]
+        )
+
+    # The generated rows, unchanged from a plain generation: audio on its 40 Hz grid from the
+    # timeline origin, video from the temporal grid.
+    target_audio_start = audio_start + context_audio_rows
+    video_start = target_audio_start + num_target_audio_rows
+    audio_time = float(num_text) + np.arange(num_audio_latents, dtype=np.float64)
+    position_ids[target_audio_start:video_start, 0] = np.tile(audio_time, AUDIO_CHANNELS)
+    position_ids[target_audio_start:video_start, 2] = np.concatenate(
+        [
+            np.full(num_audio_latents, float(width_grid[0]), dtype=np.float64),
+            np.full(num_target_audio_rows - num_audio_latents, float(width_grid[-1]), dtype=np.float64),
+        ]
+    )
+    video_pos = np.empty((num_latent_frames, rows_per_frame, 3), dtype=np.float64)
+    video_pos[:, :, 0] = _temporal_position_grid(num_latent_frames, float(num_text))[:, None]
+    video_pos[:, :, 1:] = frame_grid[None]
+    position_ids[video_start:] = video_pos.reshape(-1, 3)
+
+    # 2. Row indices and modality tags: pinned rows first in each modality list, which is what
+    #    the timestep plan and the decode-time trim key off.
+    video_idx = np.concatenate(
+        [np.arange(cond_start, audio_start), np.arange(video_start, seq_len)]
+    )
+    audio_idx = np.concatenate(
+        [np.arange(audio_start, target_audio_start), np.arange(target_audio_start, video_start)]
+    )
+    text_idx = np.arange(num_text)
+
+    tags = np.empty(seq_len, dtype=np.int64)
+    tags[text_idx] = text_tags
+    tags[audio_idx] = TAG_AUDIO
+    tags[video_idx] = TAG_VIDEO
+
+    return PackedSequence(
+        sequence_length=seq_len,
+        position_ids=mx.array(position_ids.astype(np.float32)),
+        token_tags=mx.array(tags.astype(np.int32)),
+        video_indices=mx.array(video_idx.astype(np.int32)),
+        audio_indices=mx.array(audio_idx.astype(np.int32)),
+        text_indices=mx.array(text_idx.astype(np.int32)),
+        num_condition_video_rows=int(context_video_rows),
+        num_condition_audio_rows=int(context_audio_rows),
+    )
+
+
 def build_row_timesteps(
     layout: PackedSequence,
     video_timestep: float,

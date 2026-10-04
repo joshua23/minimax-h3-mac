@@ -335,6 +335,35 @@ MLX 多参考打包、视觉条件、参考 VAE 编码及 CLI 已接入。`--ref
 
 24GB 内存上的三条关键实践：条件编码阶段只加载 VAE 编码器（省约 9GiB 闲置解码器）；参考视频逐 17 帧块归一化并编码，避免整段像素常驻；视觉塔产出条件行后立即释放。
 
+## 10. 多镜头工作流（片段续接）
+
+多个镜头要"接着演"而不是"重开一条"：把上一镜的**收尾画面**和**收尾声音**钉成本镜的条件行，模型读到的是真实的运动和真实的声音，而不是从一张静帧去猜。两条关键设计：
+
+* **latent 尾帧直读**——钉住的画面直接从上一镜的 latent 里切出来，与模型产出逐位相同，没有 h264 解码、缩放和 VAE 再编码在每一刀接缝上累积的色漂和发虚；
+* **音频接缝窗口**——钉住的声音是上一镜音频 latent 的尾部，**结束对齐在接缝处**并向回延伸，这让模型"接着放"而不是"重新配一段听起来像的"。
+
+钉住的头部在本镜时间线上重新生成（视频行锚定在 t=0.999、音频干净 t=1.0），交付时从片头裁掉——新镜花在钉住帧上的算力买的是运动的连续性，交付只保留续接部分。
+
+```bash
+./.venv/bin/python scripts/generate_sequence.py \
+  "A red panda waves from a tiny stage in a warm studio, cinematic lighting" \
+  "The red panda leaps off the stage and dashes away, camera follows" \
+  "The red panda runs through a misty bamboo forest" \
+  --checkpoint models/MiniMax-H3/FL2VA \
+  --transformer models/MiniMax-H3/FL2VA/transformer \
+  --turbo-lora models/Minimax-h3-Turbo-v1.0-4step-768p-bf16/minimax_h3_fl2v_turbo_4step_v1.0_768p_bf16.safetensors \
+  --sigma-shift-video 6 --sigma-shift-audio 3 --steps 5 \
+  --low-memory --memory-limit-gb 24 \
+  --resolution 512x288 --duration 5 \
+  --save-latents --output-dir out/sequence
+```
+
+- 第一镜是普通生成（可用 `--first-image` 做首帧图生视频）；之后每镜自动链上前一镜。
+- `--context-frames`：钉住多少帧上一镜画面，可选 **5 / 22 / 39 / 56**（对应 2/7/12/17 个 latent 步；5 勉强流畅，22 接近无缝，56 会把 2.3 秒渲染完即裁掉）。`--context-audio-frames`：钉住多少帧的尾部声音（0 跟随画面窗口，24 = 最后一秒）。
+- 输出：`shot-NN.mp4`（已裁剪的单镜）+ `sequence.mp4`（ffmpeg concat 拼接）；`--save-latents` 保存每镜 latent 供跨进程续接（`ClipLatents.load`，配合 `--chain-from` 可从任意一镜继续）。
+- 链式要求同分辨率；时长可以不同。窗口必须是整 latent 步——上一镜尾部从循环位置 0 开始，这一点在切片时强制断言，接缝错位宁可拒绝也不渲染。
+- 交付帧数 = 镜头帧数 − 钉住帧数（512×288 / 5 秒双镜实测：第二镜交付 102 帧 + 4.26 秒音频；第一镜尾帧与第二镜首个交付帧的相关系数 **0.997**，接缝肉眼不可见）。
+
 ---
 
 # 24GB M4 Pro 实测性能

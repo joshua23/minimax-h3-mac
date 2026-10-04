@@ -18,6 +18,7 @@ import gc
 import time
 from dataclasses import dataclass
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import mlx.core as mx
 import numpy as np
@@ -41,6 +42,7 @@ from .packing import (
     align_num_frames,
     audio_latent_num_frames,
     build_packed_sequence,
+    build_motion_context_packed_sequence,
     build_ref2va_packed_sequence,
     build_row_timesteps,
     patchify_video_latents,
@@ -50,6 +52,9 @@ from .packing import (
     video_latent_num_frames,
 )
 from .scheduler import MiniMaxH3Scheduler
+
+if TYPE_CHECKING:
+    from .motion_context import ClipLatents
 
 
 def _call_mlx_memory_control(name: str, *args) -> bool:
@@ -95,6 +100,8 @@ class GenerationResult:
     seconds_per_step: float = 0.0
     total_seconds: float = 0.0
     block_cache_stats: dict[str, int | float] | None = None
+    video_latents: np.ndarray | None = None  # (1, C, T, H, W) normalized — chaining input
+    audio_latents: np.ndarray | None = None  # (2, A, T) normalized, channel-major
 
 
 def detach_bfloat16(array: mx.array) -> mx.array:
@@ -603,6 +610,10 @@ class MiniMaxH3Pipeline:
         images: list | None = None,
         keyframe_anchors: tuple[str, ...] = (),
         references: list | None = None,
+        context: "ClipLatents | None" = None,
+        context_video_frames: int = 22,
+        context_audio_frames: int = 24,
+        return_latents: bool = False,
         height: int | None = None,
         width: int | None = None,
         drop_adaln: bool = True,
@@ -618,6 +629,15 @@ class MiniMaxH3Pipeline:
             keyframe_anchors: ``"first"`` / ``"last"`` per conditioning keyframe, in packed order.
             references: ``ref2va`` omni-references (:class:`ref2va.Reference`), in the order the
                 model should read them. Needs the Ref2VA transformer as ``--transformer``.
+            context: the previous clip's latents (:class:`motion_context.ClipLatents`) for a
+                chained shot: its tail frames and tail sound are pinned as conditioning, and the
+                pinned head is trimmed off the delivered clip.
+            context_video_frames: frames of the previous clip's picture to pin (whole-latent-step
+                windows: 5, 22, 39 or 56).
+            context_audio_frames: frames of tail sound to pin, end-aligned with the join
+                (0 follows the video window; 24 is the last second).
+            return_latents: attach this clip's normalized latents to the result, the chaining
+                input of the next shot.
             height, width: override the canvas ``aspect`` would resolve to. Both must be multiples
                 of 32. H3 was released for a 768-pixel short edge only, so anything else is
                 off-distribution — useful for exercising the pipeline, not for quality.
@@ -627,6 +647,11 @@ class MiniMaxH3Pipeline:
         run_started = time.perf_counter()
         if references is not None and (images or keyframe_anchors):
             raise ValueError("Keyframe images and Ref2VA references cannot be combined in one request.")
+        if context is not None and (images or keyframe_anchors or references is not None):
+            raise ValueError(
+                "Motion context chains an fl2va-family clip; pass it alone, not with keyframe "
+                "images or ref2va references."
+            )
 
         # Geometry. References never bind the generated canvas: the aspect (or explicit size) does.
         if height is None or width is None:
@@ -648,6 +673,37 @@ class MiniMaxH3Pipeline:
             prepared_references, _ = prepare_references(
                 references, num_frames, self._audio_config.sampling_rate
             )
+
+        motion = None
+        if context is not None:
+            from .motion_context import build_motion_context
+
+            if (
+                context.video.shape[1] != self._video_config.latent_channels
+                or tuple(context.video.shape[3:]) != (latent_height, latent_width)
+                or context.audio.shape[0] != 2
+                or context.audio.shape[1] != self._audio_config.latent_channels
+            ):
+                raise ValueError(
+                    f"The context clip carries latents {tuple(context.video.shape)}/"
+                    f"{tuple(context.audio.shape)} but this clip runs at C="
+                    f"{self._video_config.latent_channels}, ({latent_height}, {latent_width}) / "
+                    f"(2, {self._audio_config.latent_channels}); a latent cannot be resized, so "
+                    "regenerate the previous clip at this resolution."
+                )
+            motion = build_motion_context(
+                context,
+                patch_size,
+                context_frames=context_video_frames,
+                context_audio_frames=context_audio_frames,
+            )
+            if verbose:
+                print(
+                    f"motion context: pinning {motion.covered} frames ({motion.steps} latent steps) "
+                    f"+ {motion.audio_steps} audio steps of tail sound; delivered trim "
+                    f"{motion.trim_frames} frames",
+                    flush=True,
+                )
 
         if self._low_memory:
             from .text_encoder import MiniMaxH3TextEncoder
@@ -766,6 +822,21 @@ class MiniMaxH3Pipeline:
                 num_audio_latents,
                 patch_size,
             )
+        elif motion is not None:
+            layout = build_motion_context_packed_sequence(
+                text_token_tags,
+                motion.steps,
+                motion.offsets,
+                motion.num_condition_video_rows,
+                motion.num_condition_audio_rows,
+                motion.audio_steps,
+                motion.audio_start_coord,
+                num_latent_frames,
+                latent_height,
+                latent_width,
+                num_audio_latents,
+                patch_size,
+            )
         else:
             layout = build_packed_sequence(
                 text_token_tags,
@@ -798,6 +869,20 @@ class MiniMaxH3Pipeline:
             ref_video_rows = MiniMaxH3Scheduler(shift=self.config.sigma_shift_video).scale_noise(
                 ref_video_rows, KEYFRAME_NOISE_AUG, ref_noise
             )
+        if motion is not None:
+            # The pinned head is noised to the keyframe conditioning level like any anchor; the
+            # seam audio rides clean and costs no noise draw at all.
+            pin_noise = mx.random.normal(motion.video_rows.shape).astype(mx.float32)
+            pinned_video_rows = MiniMaxH3Scheduler(shift=self.config.sigma_shift_video).scale_noise(
+                mx.array(np.asarray(motion.video_rows, np.float32)),
+                KEYFRAME_NOISE_AUG,
+                pin_noise,
+            )
+            pinned_audio_rows = (
+                mx.array(np.asarray(motion.audio_rows, np.float32))
+                if motion.audio_rows is not None
+                else None
+            )
 
         latents = mx.random.normal(
             (1, self._video_config.latent_channels, num_latent_frames, latent_height, latent_width)
@@ -812,6 +897,10 @@ class MiniMaxH3Pipeline:
             video_rows = mx.concatenate([ref_video_rows, video_rows])
         if ref_audio_rows is not None:
             audio_rows = mx.concatenate([ref_audio_rows, audio_rows])
+        if motion is not None:
+            video_rows = mx.concatenate([pinned_video_rows, video_rows])
+            if pinned_audio_rows is not None:
+                audio_rows = mx.concatenate([pinned_audio_rows, audio_rows])
 
         # 5. Two schedules over one shared forward.
         video_sched, audio_sched = self._build_schedules(num_inference_steps)
@@ -967,6 +1056,30 @@ class MiniMaxH3Pipeline:
                 eval_output=False,
             )
         total = time.perf_counter() - run_started
+
+        # The pinned head occupies the front of the new timeline and is re-generated as context;
+        # the delivered clip starts at the join, picture and sound together.
+        if motion is not None:
+            video = video[motion.covered :]
+            audio = audio[:, int(round(motion.covered / FPS * self._audio_config.sampling_rate)) :]
+
+        video_latents = audio_latents = None
+        if return_latents:
+            # The tail of the row arrays is the generated target in both load modes — exactly the
+            # normalized latents the denoiser wrote, the next shot's chaining input.
+            target_video_rows = video_rows[-num_latent_frames * (latent_height // patch_size[1]) * (latent_width // patch_size[2]) :]
+            video_latents = np.array(
+                unpatchify_video_tokens(
+                    target_video_rows,
+                    num_latent_frames,
+                    latent_height,
+                    latent_width,
+                    self._video_config.latent_channels,
+                    patch_size,
+                )
+            )
+            audio_latents = np.array(unpack_audio_tokens(audio_rows[-num_audio_latents * AUDIO_CHANNELS :], num_audio_latents))
+
         return GenerationResult(
             video=video,
             audio=audio,
@@ -974,6 +1087,8 @@ class MiniMaxH3Pipeline:
             seconds_per_step=sum(step_times) / max(len(step_times), 1),
             total_seconds=total,
             block_cache_stats=block_cache.stats() if block_cache is not None else None,
+            video_latents=video_latents,
+            audio_latents=audio_latents,
         )
 
     # -- decoding -----------------------------------------------------------------------------
